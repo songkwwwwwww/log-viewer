@@ -158,3 +158,10 @@ cython_debug/
 
 # macOS
 .DS_Store
+
+# Data assets
+assets/
+
+AGENTS.md
+GEMINI.md
+CLAUDE.md
