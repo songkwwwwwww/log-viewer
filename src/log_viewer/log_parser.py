@@ -2,7 +2,9 @@
 
 import json
 from typing import List
-from .data_model import Point3D, Quaternion, ObjectState, PoseAtTime, SceneFrame
+
+from .geometry import Point3D, Quaternion
+from .scene_model import ObjectState, PoseAtTime, SceneFrame
 
 
 class LogParser:

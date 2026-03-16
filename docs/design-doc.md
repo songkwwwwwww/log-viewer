@@ -102,6 +102,11 @@ The system consists of a data processing layer (Parser), a control layer (Core A
 
 Uses a Cartesian coordinate system (X, Y, Z, Quaternions). XODR visualization begins by transforming lane and boundary geometry data.
 
+For implementation, the data model is split by responsibility:
+- `geometry.py`: shared primitives such as `Point3D` and `Quaternion`
+- `map_model.py`: OpenDRIVE-derived map structures
+- `scene_model.py`: logged dynamic object and frame structures
+
 ### 5.1 Geometry Foundations
 
 ```python
@@ -133,14 +138,25 @@ class LaneBoundary:
 @dataclass
 class Lane:
     id: str
+    road_id: str
     type: str               # determines surface color/texture (driving, sidewalk, etc.)
     left_boundary: LaneBoundary
     right_boundary: LaneBoundary
     center_line: List[Point3D] # used for trajectory generation or path visualization
+    is_left: bool = False   # lane direction relative to reference line
+
+@dataclass
+class RoadLink:
+    road_id: str
+    successor_road_id: Optional[str]
+    successor_type: str
+    end_point: Point3D
+    successor_start_point: Optional[Point3D]
 
 @dataclass
 class XodrMapData:
     lanes: List[Lane]
+    road_links: List[RoadLink]
 ```
 
 ### 5.3 Scene Dynamic Data

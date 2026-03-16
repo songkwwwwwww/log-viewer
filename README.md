@@ -49,7 +49,10 @@ log-viewer/
 │   └── test_run.py          # Test script for initializing and running the viewer
 └── src/
     └── log_viewer/          # Core source code
-        ├── data_model.py    # Map (Lane) and Scene (SceneFrame) data models
+        ├── geometry.py      # Shared geometry primitives
+        ├── map_model.py     # OpenDRIVE map data models
+        ├── scene_model.py   # Dynamic object/logging data models
+        ├── data_model.py    # Backward-compatible model re-exports
         ├── viewer.py        # Rendering interface with Rerun SDK
         ├── xodr_parser.py   # OpenDRIVE geometry parsing logic
         └── log_parser.py    # Time-series log parsing logic

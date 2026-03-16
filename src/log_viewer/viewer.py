@@ -6,7 +6,9 @@ import rerun as rr
 import rerun.blueprint as rrb
 import numpy as np
 from typing import Optional
-from .data_model import XodrMapData, SceneFrame
+
+from .map_model import XodrMapData
+from .scene_model import SceneFrame
 
 # Lane type color palette [R, G, B, A]
 _LANE_COLORS = {

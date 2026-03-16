@@ -2,7 +2,8 @@ import xml.etree.ElementTree as ET
 import math
 from typing import List, Optional
 
-from .data_model import Point3D, LaneBoundary, Lane, XodrMapData, RoadLink
+from .geometry import Point3D
+from .map_model import Lane, LaneBoundary, RoadLink, XodrMapData
 
 
 class XodrParser:

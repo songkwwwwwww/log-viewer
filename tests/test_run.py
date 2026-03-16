@@ -3,13 +3,9 @@ import os
 import time
 from typing import List
 
-from log_viewer.data_model import (
-    ObjectState,
-    Point3D,
-    Quaternion,
-    SceneFrame,
-    XodrMapData,
-)
+from log_viewer.geometry import Point3D, Quaternion
+from log_viewer.map_model import XodrMapData
+from log_viewer.scene_model import ObjectState, SceneFrame
 from log_viewer.viewer import LogViewer
 from log_viewer.xodr_parser import parse_xodr
 
