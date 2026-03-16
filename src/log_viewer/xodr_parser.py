@@ -1,9 +1,50 @@
 import xml.etree.ElementTree as ET
 import math
+from dataclasses import dataclass
 from typing import List, Optional
 
 from .geometry import Point3D
 from .map_model import Lane, LaneBoundary, RoadLink, XodrMapData
+
+
+@dataclass
+class ElevationEntry:
+    """Represents a single elevation record in a cubic polynomial profile."""
+
+    s: float
+    a: float
+    b: float
+    c: float
+    d: float
+
+
+class ElevationProfile:
+    """Manages multiple elevation entries and evaluates Z at any s position."""
+
+    def __init__(self, entries: List[ElevationEntry]):
+        """Initialize with a list of elevation entries, sorted by s."""
+        self.entries = sorted(entries, key=lambda e: e.s)
+
+    def get_z(self, s: float) -> float:
+        """Calculate the elevation Z at distance s along the road."""
+        if not self.entries:
+            return 0.0
+
+        # Find the entry starting at or just before s
+        active_entry = self.entries[0]
+        for entry in self.entries:
+            if s >= entry.s:
+                active_entry = entry
+            else:
+                break
+
+        ds = s - active_entry.s
+        return (
+            active_entry.a
+            + active_entry.b * ds
+            + active_entry.c * ds**2
+            + active_entry.d * ds**3
+        )
 
 
 class XodrParser:
@@ -31,8 +72,13 @@ class XodrParser:
         for road in self.root.findall("road"):
             road_id = road.get("id", "unknown")
 
-            # 1. Parse Reference Line (planView)
-            ref_line_pts = self._parse_plan_view(road)
+            # 1. Parse Elevation Profile
+            elevation_profile = self._parse_elevation_profile(road)
+
+            # 2. Parse Reference Line (planView)
+            ref_line_pts = self._parse_plan_view(
+                road, elevation_profile=elevation_profile
+            )
             if not ref_line_pts:
                 continue
 
@@ -122,8 +168,28 @@ class XodrParser:
             return float(width_tag.get("a", 3.0))
         return 3.0
 
+    def _parse_elevation_profile(self, road: ET.Element) -> ElevationProfile:
+        """Parse the elevationProfile for a road."""
+        entries = []
+        profile_tag = road.find("elevationProfile")
+        if profile_tag is not None:
+            for elev in profile_tag.findall("elevation"):
+                entries.append(
+                    ElevationEntry(
+                        s=float(elev.get("s", 0)),
+                        a=float(elev.get("a", 0)),
+                        b=float(elev.get("b", 0)),
+                        c=float(elev.get("c", 0)),
+                        d=float(elev.get("d", 0)),
+                    )
+                )
+        return ElevationProfile(entries)
+
     def _parse_plan_view(
-        self, road: ET.Element, step_size: float = 2.0
+        self,
+        road: ET.Element,
+        step_size: float = 2.0,
+        elevation_profile: Optional[ElevationProfile] = None,
     ) -> List[Point3D]:
         """Parse the reference line geometries into a list of points."""
         plan_view = road.find("planView")
@@ -132,21 +198,27 @@ class XodrParser:
 
         pts = []
         for geom in plan_view.findall("geometry"):
+            s_start = float(geom.get("s", 0))
             x0 = float(geom.get("x", 0))
             y0 = float(geom.get("y", 0))
             hdg = float(geom.get("hdg", 0))
             length = float(geom.get("length", 0))
 
-            # Very basic parsing for lines and arcs
+            # Basic parsing for lines and arcs
             if geom.find("line") is not None:
-                # Interpolate points along the line
                 num_steps = max(2, int(length / step_size))
                 for i in range(num_steps + 1):
                     t = i / num_steps
-                    arc_len = t * length
-                    x = x0 + arc_len * math.cos(hdg)
-                    y = y0 + arc_len * math.sin(hdg)
-                    pts.append(Point3D(x, y, 0))
+                    ds = t * length
+                    s_curr = s_start + ds
+                    x = x0 + ds * math.cos(hdg)
+                    y = y0 + ds * math.sin(hdg)
+                    z = (
+                        elevation_profile.get_z(s_curr)
+                        if elevation_profile
+                        else 0.0
+                    )
+                    pts.append(Point3D(x, y, z))
 
             elif geom.find("arc") is not None:
                 arc = geom.find("arc")
@@ -154,21 +226,24 @@ class XodrParser:
                 num_steps = max(2, int(length / step_size))
                 for i in range(num_steps + 1):
                     t = i / num_steps
-                    arc_len = t * length
+                    ds = t * length
+                    s_curr = s_start + ds
                     if curvature == 0:
-                        x = x0 + arc_len * math.cos(hdg)
-                        y = y0 + arc_len * math.sin(hdg)
+                        x = x0 + ds * math.cos(hdg)
+                        y = y0 + ds * math.sin(hdg)
                     else:
                         radius = 1.0 / curvature
-                        # arc center
                         cx = x0 - radius * math.sin(hdg)
                         cy = y0 + radius * math.cos(hdg)
-                        # angle
-                        theta = hdg - math.pi / 2 + arc_len * curvature
+                        theta = hdg - math.pi / 2 + ds * curvature
                         x = cx + radius * math.cos(theta)
                         y = cy + radius * math.sin(theta)
-                    pts.append(Point3D(x, y, 0))
-            # Ignored: spiral, poly3, paramPoly3 for MVP
+                    z = (
+                        elevation_profile.get_z(s_curr)
+                        if elevation_profile
+                        else 0.0
+                    )
+                    pts.append(Point3D(x, y, z))
 
         return pts
 
@@ -210,18 +285,28 @@ class XodrParser:
             else:
                 nx, ny = -dy / norm, dx / norm  # Left-pointing normal
 
-            px, py = ref_line[i].x, ref_line[i].y
+            px, py, pz = ref_line[i].x, ref_line[i].y, ref_line[i].z
 
             center_pts.append(
                 Point3D(
-                    px + nx * sign * center_offset, py + ny * sign * center_offset, 0
+                    px + nx * sign * center_offset,
+                    py + ny * sign * center_offset,
+                    pz,
                 )
             )
             inner_pts.append(
-                Point3D(px + nx * sign * inner_offset, py + ny * sign * inner_offset, 0)
+                Point3D(
+                    px + nx * sign * inner_offset,
+                    py + ny * sign * inner_offset,
+                    pz,
+                )
             )
             outer_pts.append(
-                Point3D(px + nx * sign * outer_offset, py + ny * sign * outer_offset, 0)
+                Point3D(
+                    px + nx * sign * outer_offset,
+                    py + ny * sign * outer_offset,
+                    pz,
+                )
             )
 
         # Left lanes: "left boundary" is outer, "right boundary" is inner
