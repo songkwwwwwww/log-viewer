@@ -34,6 +34,10 @@ class LogViewer:
                 rrb.Spatial3DView(
                     name="3D View",
                     origin="/",
+                    contents=[
+                        "map/**",
+                        "objects/*/box",
+                    ],
                 ),
                 rrb.Vertical(
                     # Right-top: speed & acceleration
