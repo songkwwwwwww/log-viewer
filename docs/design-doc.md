@@ -93,6 +93,7 @@ The system consists of a data processing layer (Parser), a control layer (Core A
 
 1. **XodrParser**: Parses OpenDRIVE format and extracts only geometry for visualization (Lane, Boundary coordinates).
 2. **LogParser**: Reads historical logs and organizes them by timestamp into `SceneFrame` structures.
+   - Optionally loads a sidecar metadata JSON file containing a global transform from `sim` to `xodr_enu`.
 3. **LogViewer Core**: The main public API; pushes real-time data via `render_state()` or uploads full datasets to the visualization engine via `load_log()`.
 4. **Visualization Engine**: The Rerun Viewer process handles the actual rendering and playback controls.
 
@@ -219,13 +220,33 @@ Standard structure for frame-by-frame logging. Supports JSON arrays or JSON Line
 
 - **JSON Lines (.jsonl)**: For very large logs, `.jsonl` is more efficient than a single massive array.
 
+### 5.5 Optional Metadata Sidecar Format
+
+When log coordinates in the `sim` frame need to be aligned to the map's `xodr_enu` frame, an optional metadata JSON file can be provided alongside the log.
+
+```json
+{
+  "sim_to_xodr_enu": [
+    [1.0, 0.0, 0.0, 10.0],
+    [0.0, 1.0, 0.0, 20.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}
+```
+
+- Preferred key: `sim_to_xodr_enu`
+- Alternative key: `xodr_enu_to_sim` and invert it internally
+- The resulting `sim -> xodr_enu` matrix is applied to object positions and future trajectory positions while parsing the log.
+- This metadata is optional and intended for a single global transform shared by the entire log.
+
 ---
 
 ## 6. Risks & Future Work
 
 1. **Coordinate System Alignment**
    - XODR map coordinates may differ from external log data (e.g., ENU, NED, or local frames).
-   - *Mitigation*: The `init_xodr` API accepts an optional 4x4 `transform_matrix` to align data.
+   - *Mitigation*: Allow an optional metadata sidecar file to provide a global `sim -> xodr_enu` 4x4 transform applied while parsing the log.
 2. **Geometry Vertex Overhead**
    - Rendering vast XODR maps as dense `Point3D` sets can be resource-intensive.
    - *Mitigation*: Implement dynamic sampling based on distance (LOD) or cache static meshes on initial load.

@@ -45,6 +45,25 @@ uv run log-viewer-replay --map path/to/map.xodr --log path/to/log.jsonl
 
 This command parses the map, loads all frames from the log, and sends them to the Rerun viewer for timeline-based inspection.
 
+If your log coordinates are in the `sim` frame and need alignment with the map's `xodr_enu` frame, you can also provide an optional metadata file:
+
+```bash
+uv run log-viewer-replay --map path/to/map.xodr --log path/to/log.jsonl --meta path/to/log.meta.json
+```
+
+Example metadata file:
+
+```json
+{
+  "sim_to_xodr_enu": [
+    [1.0, 0.0, 0.0, 10.0],
+    [0.0, 1.0, 0.0, 20.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}
+```
+
 ---
 
 ## 🗂 Project Structure
@@ -104,3 +123,10 @@ Supports single JSON arrays or line-delimited JSON (JSONL) matching the `SceneFr
 ]
 ```
 *(For detailed data hierarchy, refer to `docs/design-doc.md`.)*
+
+### 3. Optional Log Metadata (.json)
+An optional metadata file may be provided alongside the log to define the coordinate transform from `sim` to `xodr_enu`. When present, the parser applies it to each object's position and future trajectory points as frames are loaded.
+
+Supported keys:
+- `sim_to_xodr_enu`: preferred 4x4 homogeneous transform
+- `xodr_enu_to_sim`: accepted as an alternative and inverted internally
