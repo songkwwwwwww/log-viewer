@@ -19,6 +19,9 @@ dev = [
     "pytest>=7.0.0",
 ]
 
+[project.scripts]
+log-viewer-replay = "log_viewer.replay_log:main"
+
 [dependency-groups]
 dev = [
     "ruff>=0.15.6",

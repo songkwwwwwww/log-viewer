@@ -35,6 +35,16 @@ Running this command will launch the **Rerun Viewer**, where you can see:
 2. Vehicle movement (blue boxes) and trajectory lines from `dummy_log.json` (or generated simulation).
 3. **Timeline Scrubber** at the bottom for playback control and time seeking.
 
+### Replaying Your Own Map and Log
+
+If you already have an `.xodr` map and a log file matching the documented JSON/JSONL format, run:
+
+```bash
+uv run log-viewer-replay --map path/to/map.xodr --log path/to/log.jsonl
+```
+
+This command parses the map, loads all frames from the log, and sends them to the Rerun viewer for timeline-based inspection.
+
 ---
 
 ## 🗂 Project Structure
@@ -53,6 +63,7 @@ log-viewer/
         ├── map_model.py     # OpenDRIVE map data models
         ├── scene_model.py   # Dynamic object/logging data models
         ├── data_model.py    # Backward-compatible model re-exports
+        ├── replay_log.py    # CLI entry point for map + log replay
         ├── viewer.py        # Rendering interface with Rerun SDK
         ├── xodr_parser.py   # OpenDRIVE geometry parsing logic
         └── log_parser.py    # Time-series log parsing logic
