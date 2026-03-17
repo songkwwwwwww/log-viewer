@@ -166,14 +166,11 @@ def load_transform_matrix(meta_file_path: str) -> np.ndarray:
         matrix = np.linalg.inv(inverse_matrix)
     else:
         raise ValueError(
-            "Metadata file must contain either 'sim_to_xodr_enu' "
-            "or 'xodr_enu_to_sim'."
+            "Metadata file must contain either 'sim_to_xodr_enu' or 'xodr_enu_to_sim'."
         )
 
     if matrix.shape != (4, 4):
-        raise ValueError(
-            "sim_to_xodr_enu must be a 4x4 array in the metadata file."
-        )
+        raise ValueError("sim_to_xodr_enu must be a 4x4 array in the metadata file.")
 
     return matrix
 
