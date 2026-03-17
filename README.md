@@ -9,15 +9,20 @@ It renders timestamp-based JSON object logs (vehicles, pedestrians, etc.) on top
 ## 🚀 Getting Started
 
 ### Prerequisites
+
 This project uses [`uv`](https://github.com/astral-sh/uv), a modern Python package manager, for dependency and environment management.
+
 - Python >= 3.9
 - [Install uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ### Setup and Installation
+
 Sync dependencies in the project root:
+
 ```bash
 uv sync
 ```
+
 *(`uv` will automatically create a `.venv` and install required dependencies like `rerun-sdk` and `numpy`.)*
 
 ---
@@ -31,6 +36,7 @@ uv run tests/test_run.py
 ```
 
 Running this command will launch the **Rerun Viewer**, where you can see:
+
 1. Lane visualization based on `assets/Town01.xodr`.
 2. Vehicle movement (blue boxes) and trajectory lines from `dummy_log.json` (or generated simulation).
 3. **Timeline Scrubber** at the bottom for playback control and time seeking.
@@ -93,10 +99,13 @@ log-viewer/
 ## 📝 Data Formats
 
 ### 1. Map Data (.xodr)
+
 Loads OpenDRIVE (`.xodr`) maps. It currently supports `line` and `arc` segments in `<planView>` and renders lane boundaries based on width coefficients.
 
 ### 2. Simulation Log (.json / .jsonl)
+
 Supports single JSON arrays or line-delimited JSON (JSONL) matching the `SceneFrame` structure.
+
 ```json
 [
   {
@@ -122,11 +131,14 @@ Supports single JSON arrays or line-delimited JSON (JSONL) matching the `SceneFr
   }
 ]
 ```
+
 *(For detailed data hierarchy, refer to `docs/design-doc.md`.)*
 
 ### 3. Optional Log Metadata (.json)
+
 An optional metadata file may be provided alongside the log to define the coordinate transform from `sim` to `xodr_enu`. When present, the parser applies it to each object's position and future trajectory points as frames are loaded.
 
 Supported keys:
+
 - `sim_to_xodr_enu`: preferred 4x4 homogeneous transform
 - `xodr_enu_to_sim`: accepted as an alternative and inverted internally
