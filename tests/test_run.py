@@ -1,7 +1,13 @@
+"""Integration test and demonstration script for the Log Viewer.
+
+This script simulates dynamic objects (vehicles) moving along lanes in an 
+OpenDRIVE map and visualizes their movement in the Rerun-based viewer.
+"""
+
 import math
 import os
 import time
-from typing import List
+from typing import List, Dict
 
 from log_viewer.geometry import Point3D, Quaternion
 from log_viewer.map_model import XodrMapData
@@ -11,24 +17,43 @@ from log_viewer.xodr_parser import parse_xodr
 
 
 def heading_to_quaternion(yaw: float) -> Quaternion:
-    """Convert yaw angle (radians) to a Quaternion (w, x, y, z)."""
+    """Convert a 2D yaw angle (radians) to a 3D Quaternion.
+
+    Args:
+        yaw: Rotation angle around the Z-axis in radians.
+
+    Returns:
+        A Quaternion object representing the rotation.
+    """
     return Quaternion(w=math.cos(yaw / 2), x=0.0, y=0.0, z=math.sin(yaw / 2))
 
 
 def generate_simulation_frames(
     map_data: XodrMapData, duration: float = 5.0, fps: int = 10
 ) -> List[SceneFrame]:
-    """Generate frames with objects moving along lanes."""
+    """Generates synthetic simulation frames with objects moving along lanes.
+
+    This function picks a few driving lanes from the map and creates vehicles
+    that travel along the lane's centerline at a constant speed.
+
+    Args:
+        map_data: Parsed OpenDRIVE map data.
+        duration: Total simulation time in seconds.
+        fps: Frames per second (sampling rate).
+
+    Returns:
+        A list of SceneFrame objects representing the simulated timeline.
+    """
     frames = []
     num_frames = int(duration * fps)
     dt = 1.0 / fps
 
-    # Filter driving lanes
+    # Filter for drivable lanes
     driving_lanes = [lane for lane in map_data.lanes if lane.type == "driving"]
     if not driving_lanes:
         return []
 
-    # Select a few lanes for simulation
+    # Select up to 3 lanes for the simulation
     selected_lanes = driving_lanes[:3]
     vehicles = []
 
@@ -37,41 +62,43 @@ def generate_simulation_frames(
             {
                 "id": f"v{idx}",
                 "lane": lane,
-                "speed": 10.0 + idx * 2.0,  # Each vehicle has a different speed
+                "speed": 10.0 + idx * 2.0,  # Each vehicle has a distinct speed
                 "size": (4.5, 2.0, 1.5),
             }
         )
 
     for i in range(num_frames):
         timestamp = i * dt
-        objects = {}
+        objects: Dict[str, ObjectState] = {}
 
         for v in vehicles:
             lane = v["lane"]
             lane_pts = lane.center_line
-            # Total length of the lane
+            
+            # Calculate total lane length and segment lengths for interpolation
             total_dist = 0.0
             segment_lengths = []
             for j in range(len(lane_pts) - 1):
                 d = math.hypot(
-                    lane_pts[j + 1].x - lane_pts[j].x, lane_pts[j + 1].y - lane_pts[j].y
+                    lane_pts[j + 1].x - lane_pts[j].x, 
+                    lane_pts[j + 1].y - lane_pts[j].y
                 )
                 segment_lengths.append(d)
                 total_dist += d
 
-            # Current distance traveled
-            # Flip direction if it's a left lane (OpenDRIVE left lanes are backward)
+            # Determine the longitudinal distance traveled
+            # OpenDRIVE left lanes travel in reverse direction relative to the reference line
             dist_traveled = (v["speed"] * timestamp) % total_dist
             if lane.is_left:
                 dist_traveled = total_dist - dist_traveled
 
-            # Find position and tangent on the path
+            # Interpolate position and heading along the lane centerline
             curr_dist = 0.0
             pos = lane_pts[0]
             yaw = 0.0
 
             if lane.is_left:
-                # Find position from end for left lanes
+                # Find position by tracing back from the end for left lanes
                 reverse_dist = total_dist - dist_traveled
                 temp_dist = 0.0
                 for j in range(len(segment_lengths)):
@@ -84,7 +111,6 @@ def generate_simulation_frames(
                             p1.y + ratio * (p2.y - p1.y),
                             0.0,
                         )
-                        # Yaw is toward previous point for left lanes
                         yaw = math.atan2(p1.y - p2.y, p1.x - p2.x)
                         break
                     temp_dist += segment_lengths[j]
@@ -121,13 +147,20 @@ def generate_simulation_frames(
 
 
 def test_viewer():
-    """Run an enhanced visual test with dynamic object simulation."""
-    # 1. Provide Map Data
+    """Run an integration test with dynamic object simulation in Rerun.
+    
+    This function:
+    1. Loads a sample OpenDRIVE map (Town01.xodr).
+    2. Initializes the LogViewer.
+    3. Generates synthetic simulation frames.
+    4. Streams the frames to the Rerun viewer.
+    """
+    # 1. Load Map Data
     xodr_path = os.path.join(os.path.dirname(__file__), "..", "assets", "Town01.xodr")
     if os.path.exists(xodr_path):
         map_data = parse_xodr(xodr_path)
     else:
-        print("Warning: Town01.xodr not found. Map will be empty.")
+        print(f"Warning: {xodr_path} not found. Map will be empty.")
         map_data = XodrMapData(lanes=[])
 
     # 2. Init viewer
@@ -142,7 +175,7 @@ def test_viewer():
     print(f"Rendering {len(frames)} frames...")
     for frame in frames:
         viewer.render_state(frame)
-        time.sleep(0.05)
+        time.sleep(0.01)  # Throttle delivery to the viewer
 
 
 if __name__ == "__main__":

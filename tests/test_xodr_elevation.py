@@ -1,8 +1,14 @@
+"""Unit tests for the OpenDRIVE elevation profile evaluation."""
+
 from log_viewer.xodr_parser import ElevationEntry, ElevationProfile
 import pytest
 
 
 def test_elevation_profile_evaluation():
+    """Verify that elevation profile correctly interpolates and evaluates Z.
+    
+    Tests flat, linear, and multi-segment profiles.
+    """
     # Test a simple flat elevation
     flat_entry = ElevationEntry(s=0.0, a=10.0, b=0.0, c=0.0, d=0.0)
     profile = ElevationProfile([flat_entry])
@@ -28,6 +34,7 @@ def test_elevation_profile_evaluation():
 
 
 def test_elevation_profile_cubic():
+    """Verify evaluation of cubic polynomial elevation profiles."""
     # Test cubic profile z(ds) = ds^3
     cubic_entry = ElevationEntry(s=0.0, a=0.0, b=0.0, c=0.0, d=1.0)
     profile = ElevationProfile([cubic_entry])

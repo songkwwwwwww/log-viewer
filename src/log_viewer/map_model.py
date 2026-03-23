@@ -1,4 +1,8 @@
-"""Data structures for parsed OpenDRIVE map content."""
+"""Data structures for parsed OpenDRIVE map content.
+
+This module defines the structural representation of an OpenDRIVE road network,
+focusing on the geometric boundaries, lane types, and connectivity between roads.
+"""
 
 from dataclasses import dataclass
 from typing import List, Optional
@@ -8,43 +12,80 @@ from .geometry import Point3D
 
 @dataclass
 class LaneBoundary:
-    """Defines the geometry and visual style of a lane edge."""
+    """Defines the geometry and visual style of a lane edge.
 
-    id: str  # ex: "road_1_lane_-1_left"
-    style: str  # solid, dashed, etc.
+    Attributes:
+        id: Unique identifier for the boundary (e.g., "road_1_lane_-1_left").
+        style: Visual style of the boundary line (e.g., "solid", "dashed").
+        points: A sequence of 3D points defining the boundary's shape in meters.
+    """
+
+    id: str
+    style: str
     points: List[Point3D]
 
 
 @dataclass
 class Lane:
-    """Represents a single drivable or walkable lane segment."""
+    """Represents a single drivable or walkable lane segment.
+
+    A lane is defined by its boundaries and its functional type. It is part of
+    a road and follows the road's reference line.
+
+    Attributes:
+        id: Identifier for the lane (usually the integer ID from OpenDRIVE).
+        road_id: ID of the road this lane belongs to.
+        type: Functional type (e.g., "driving", "sidewalk", "biking", "shoulder").
+        left_boundary: The boundary to the left relative to the road direction.
+        right_boundary: The boundary to the right relative to the road direction.
+        center_line: Calculated center line of the lane.
+        is_left: True if the lane is on the left side of the road reference line
+            (usually implies travel direction opposite to the reference line).
+    """
 
     id: str
     road_id: str
-    type: str  # e.g., driving, sidewalk
+    type: str
     left_boundary: LaneBoundary
     right_boundary: LaneBoundary
     center_line: List[Point3D]
-    is_left: bool = False  # True = travels opposite to reference line direction
+    is_left: bool = False
 
 
 @dataclass
 class RoadLink:
-    """Represents a directional connection between two roads in OpenDRIVE."""
+    """Represents a directional connection between two roads in OpenDRIVE.
+
+    Used for visualizing the connectivity and flow between different road segments.
+
+    Attributes:
+        road_id: ID of the source road.
+        successor_road_id: ID of the connected road, if it's a direct road-to-road link.
+        successor_type: Type of connection ("road" or "junction").
+        end_point: The last point of the source road's reference line.
+        successor_start_point: The first point of the successor road's reference line.
+    """
 
     road_id: str
-    successor_road_id: Optional[str]  # None if connects to a junction
-    successor_type: str  # "road" or "junction"
-    end_point: Point3D  # last point of this road's centerline
-    successor_start_point: Optional[Point3D]  # first point of successor road, if known
+    successor_road_id: Optional[str]
+    successor_type: str
+    end_point: Point3D
+    successor_start_point: Optional[Point3D]
 
 
 @dataclass
 class XodrMapData:
-    """Contains all lanes and connectivity extracted from an OpenDRIVE map."""
+    """Contains all lanes and connectivity extracted from an OpenDRIVE map.
+
+    This is the top-level container for all static map information used by the viewer.
+
+    Attributes:
+        lanes: List of all parsed Lane objects.
+        road_links: List of connectivity links between roads.
+    """
 
     lanes: List[Lane]
-    road_links: List[RoadLink] = None  # road-to-road successor connections
+    road_links: List[RoadLink] = None
 
     def __post_init__(self):
         """Initialize mutable defaults."""

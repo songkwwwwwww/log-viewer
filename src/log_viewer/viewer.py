@@ -1,4 +1,9 @@
-"""Visualization engine utilizing rerun-sdk."""
+"""Visualization engine utilizing rerun-sdk for 3D road and object playback.
+
+This module provides the LogViewer class, which translates parsed map and
+simulation data into Rerun entities (meshes, boxes, line strips, etc.)
+for interactive visualization.
+"""
 
 import math
 
@@ -11,12 +16,15 @@ from .map_model import XodrMapData
 from .scene_model import SceneFrame
 
 # Lane type color palette [R, G, B, A]
+# Used to differentiate between driving lanes, sidewalks, etc.
 _LANE_COLORS = {
     "driving": [80, 80, 80, 255],
     "sidewalk": [120, 120, 120, 255],
     "biking": [150, 60, 60, 255],
     "shoulder": [100, 95, 90, 255],
 }
+
+# Object type colors [R, G, B]
 _OBJECT_COLORS = {
     "vehicle": [0, 100, 255],
     "pedestrian": [255, 100, 0],
@@ -24,10 +32,23 @@ _OBJECT_COLORS = {
 
 
 class LogViewer:
-    """Core Log Viewer class using rerun-sdk for 3D visualization."""
+    """Core Log Viewer class using rerun-sdk for 3D visualization.
+    
+    This class handles the initialization of the Rerun viewer, the layout
+    of the visualization workspace (blueprint), and the logging of
+    static map data and dynamic simulation frames.
+    """
 
     def __init__(self, application_id: str = "log_viewer"):
-        """Initialize the LogViewer engine."""
+        """Initialize the LogViewer engine.
+
+        Sets up the Rerun blueprint which defines the layout of the viewer:
+        - A main 3D Spatial View for the map and objects.
+        - Multiple Time Series Views for telemetry data (speed, acceleration, position).
+
+        Args:
+            application_id: Unique string identifier for the Rerun session.
+        """
         blueprint = rrb.Blueprint(
             rrb.Horizontal(
                 # Left: 3D spatial view (map + objects)
@@ -40,7 +61,7 @@ class LogViewer:
                     ],
                 ),
                 rrb.Vertical(
-                    # Right-top: speed & acceleration
+                    # Right-top: speed & acceleration telemetry
                     rrb.TimeSeriesView(
                         name="Speed & Acceleration",
                         origin="/",
@@ -49,7 +70,7 @@ class LogViewer:
                             "objects/+/scalars/acceleration",
                         ],
                     ),
-                    # Right-mid: position
+                    # Right-mid: 2D position telemetry
                     rrb.TimeSeriesView(
                         name="Position (X/Y)",
                         origin="/",
@@ -58,7 +79,7 @@ class LogViewer:
                             "objects/+/scalars/position_y",
                         ],
                     ),
-                    # Right-bottom: velocity
+                    # Right-bottom: velocity components
                     rrb.TimeSeriesView(
                         name="Velocity (Vx/Vy)",
                         origin="/",
@@ -75,13 +96,17 @@ class LogViewer:
             rrb.SelectionPanel(state="expanded"),
             rrb.TimePanel(state="expanded"),
         )
+        # Initialize Rerun and spawn the viewer window
         rr.init(application_id, spawn=True, default_blueprint=blueprint)
         self.transform_matrix = None
 
     def init_xodr(
         self, map_data: XodrMapData, transform_matrix: Optional[np.ndarray] = None
     ):
-        """Initialize the OpenDRIVE map in the viewer.
+        """Initialize and log the OpenDRIVE map in the viewer.
+
+        Iterates through all parsed lanes and logs them as 3D meshes (surfaces),
+        line strips (boundaries and centerlines), and arrows (direction).
 
         Args:
             map_data: Parsed XODR map data containing lanes and boundaries.
@@ -91,9 +116,11 @@ class LogViewer:
         self.transform_matrix = transform_matrix
 
         for lane in map_data.lanes:
+            # Each lane is logged under a unique entity path hierarchy
             entity_path = f"map/roads/{lane.road_id}/lanes/{lane.id}"
 
             # ---------- 1. Lane surface (Mesh3D) ----------
+            # We construct a triangle strip mesh between the left and right boundaries
             left_pts = lane.left_boundary.points
             right_pts = lane.right_boundary.points
 
@@ -101,10 +128,12 @@ class LogViewer:
                 vertices = []
                 indices = []
                 for i in range(len(left_pts)):
+                    # Add vertices for both boundaries at each longitudinal step
                     vertices.append([left_pts[i].x, left_pts[i].y, left_pts[i].z])
                     vertices.append([right_pts[i].x, right_pts[i].y, right_pts[i].z])
 
                     if i < len(left_pts) - 1:
+                        # Define two triangles per segment to form a quad
                         idx_l1 = 2 * i
                         idx_r1 = 2 * i + 1
                         idx_l2 = 2 * i + 2
@@ -126,9 +155,11 @@ class LogViewer:
                         road_id=lane.road_id,
                         lane_type=lane.type,
                     ),
+                    static=True, # Map data is static across all time
                 )
 
             # ---------- 2. Lane boundaries (LineStrips3D) ----------
+            # Log the left and right boundary lines as distinct entities
             for boundary, name in [
                 (lane.left_boundary, "left_boundary"),
                 (lane.right_boundary, "right_boundary"),
@@ -138,15 +169,18 @@ class LogViewer:
                     rr.log(
                         f"{entity_path}/{name}",
                         rr.LineStrips3D([pts], colors=[200, 200, 200]),
+                        static=True,
                     )
 
             # ---------- 3. Center line + direction arrows ----------
+            # Log the centerline and add directional arrows for orientation
             cps = lane.center_line
             if len(cps) >= 2:
                 center_pts = [[p.x, p.y, p.z] for p in cps]
                 rr.log(
                     f"{entity_path}/center",
                     rr.LineStrips3D([center_pts], colors=[255, 255, 0]),
+                    static=True,
                 )
 
                 # Left lanes travel opposite to the reference line direction
@@ -182,31 +216,34 @@ class LogViewer:
                         colors=[255, 200, 0],  # Amber
                         radii=0.2,
                     ),
+                    static=True,
                 )
 
     def render_state(self, frame: SceneFrame):
         """Render a single frame of simulation state.
 
         Logs:
-          - 3D bounding boxes for all objects (batched).
+          - 3D bounding boxes for all objects.
           - Future trajectory line per object.
-          - Per-object scalar timeseries (speed, acceleration, position x/y/z).
+          - Per-object scalar timeseries (speed, acceleration, position, velocity).
 
         Args:
             frame: The scene frame containing all object states at a given timestamp.
         """
-        rr.set_time("sim_time", duration=frame.timestamp)
+        # Set the current simulation time in Rerun
+        rr.set_time_seconds("sim_time", frame.timestamp)
 
         for obj_id, obj in frame.objects.items():
             obj_path = f"objects/{obj_id}"
 
-            # ---- Derived values ----
+            # ---- Derived values for telemetry ----
             speed = math.sqrt(obj.velocity.x**2 + obj.velocity.y**2 + obj.velocity.z**2)
             accel = math.sqrt(
                 obj.acceleration.x**2 + obj.acceleration.y**2 + obj.acceleration.z**2
             )
 
             # ---- Per-object 3D bounding box + Selection metadata ----
+            # Bounding boxes represent the physical extent of the object
             color = _OBJECT_COLORS.get(obj.type, [200, 200, 200])
             rr.log(
                 f"{obj_path}/box",
@@ -239,21 +276,24 @@ class LogViewer:
             )
 
             # ---- Scalar timeseries per object ----
-            rr.log(f"{obj_path}/scalars/speed", rr.Scalars(speed))
-            rr.log(f"{obj_path}/scalars/acceleration", rr.Scalars(accel))
-            rr.log(f"{obj_path}/scalars/position_x", rr.Scalars(obj.position.x))
-            rr.log(f"{obj_path}/scalars/position_y", rr.Scalars(obj.position.y))
-            rr.log(f"{obj_path}/scalars/position_z", rr.Scalars(obj.position.z))
-            rr.log(f"{obj_path}/scalars/velocity_x", rr.Scalars(obj.velocity.x))
-            rr.log(f"{obj_path}/scalars/velocity_y", rr.Scalars(obj.velocity.y))
+            # These are plotted in the TimeSeriesViews defined in the blueprint
+            rr.log(f"{obj_path}/scalars/speed", rr.Scalar(speed))
+            rr.log(f"{obj_path}/scalars/acceleration", rr.Scalar(accel))
+            rr.log(f"{obj_path}/scalars/position_x", rr.Scalar(obj.position.x))
+            rr.log(f"{obj_path}/scalars/position_y", rr.Scalar(obj.position.y))
+            rr.log(f"{obj_path}/scalars/position_z", rr.Scalar(obj.position.z))
+            rr.log(f"{obj_path}/scalars/velocity_x", rr.Scalar(obj.velocity.x))
+            rr.log(f"{obj_path}/scalars/velocity_y", rr.Scalar(obj.velocity.y))
 
             # ---- Future trajectory ----
+            # Draws a line representing the predicted future path of the object
             if obj.future_trajectory:
                 traj_pts = [
                     [p.position.x, p.position.y, p.position.z]
                     for p in obj.future_trajectory
                 ]
                 if traj_pts:
+                    # Prepend current position to connect the line to the object
                     traj_pts.insert(0, [obj.position.x, obj.position.y, obj.position.z])
                     rr.log(
                         f"{obj_path}/trajectory",

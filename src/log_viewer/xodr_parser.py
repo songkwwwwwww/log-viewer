@@ -1,3 +1,19 @@
+"""Parses OpenDRIVE (.xodr) files into a 3D road network model.
+
+This module implements a subset of the OpenDRIVE specification, focusing on 
+extracting road geometries, lane structures, and connectivity for 3D visualization.
+
+Key OpenDRIVE concepts handled:
+- Reference Line (planView): The "spine" of the road, defined by geometric primitives 
+  (lines, arcs, spirals, polynomials).
+- s-coordinate: Longitudinal distance along the reference line.
+- t-coordinate: Lateral offset from the reference line.
+- Lane Sections: Segments of the road where the lane configuration (number of lanes, 
+  widths) is constant.
+- Profiles: Elevation (z), Superelevation (banking/roll), and Lane Offset (lateral shift 
+  of the entire lane group).
+"""
+
 import xml.etree.ElementTree as ET
 import math
 from dataclasses import dataclass
@@ -8,6 +24,7 @@ from .map_model import Lane, LaneBoundary, RoadLink, XodrMapData
 
 
 def _normalize_3d(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """Normalizes a 3D vector to unit length."""
     n = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
     if n == 0:
         return (0.0, 0.0, 1.0)
@@ -17,6 +34,7 @@ def _normalize_3d(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
 def _cross_product(
     a: Tuple[float, float, float], b: Tuple[float, float, float]
 ) -> Tuple[float, float, float]:
+    """Computes the cross product of two 3D vectors."""
     return (
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -27,7 +45,10 @@ def _cross_product(
 def _compute_3d_tangent(
     ref_line: List[Point3D], i: int
 ) -> Tuple[float, float, float]:
-    """Central-difference 3D tangent along the reference line."""
+    """Computes the 3D tangent vector (e_s) at a point on the reference line.
+    
+    Uses central difference between neighboring points.
+    """
     n = len(ref_line)
     p1 = ref_line[max(0, i - 1)]
     p2 = ref_line[min(n - 1, i + 1)]
@@ -37,10 +58,12 @@ def _compute_3d_tangent(
 def _compute_e_t(
     e_s: Tuple[float, float, float], theta: float
 ) -> Tuple[float, float, float]:
-    """Lateral unit vector accounting for superelevation angle theta.
+    """Computes the lateral unit vector (e_t) accounting for road superelevation.
 
-    Mirrors Road::get_xyz() in libOpenDRIVE/src/Road.cpp.
-    When theta=0 this reduces to the 2D left-pointing normal.
+    The superelevation angle theta represents the "roll" or "banking" of the road.
+    When theta=0, e_t is simply the 2D left-pointing normal to the reference line.
+    
+    Calculation mirrors Road::get_xyz() in libOpenDRIVE/src/Road.cpp.
     """
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
@@ -63,7 +86,11 @@ class ElevationEntry:
 
 
 class ElevationProfile:
-    """Manages multiple elevation entries and evaluates Z at any s position."""
+    """Manages multiple elevation entries and evaluates Z at any s position.
+    
+    Elevation is defined as a sequence of cubic polynomials relative to the
+    longitudinal position s.
+    """
 
     def __init__(self, entries: List[ElevationEntry]):
         """Initialize with a list of elevation entries, sorted by s."""
@@ -74,7 +101,7 @@ class ElevationProfile:
         if not self.entries:
             return 0.0
 
-        # Find the entry starting at or just before s
+        # Find the "active" polynomial entry for the given s
         active_entry = self.entries[0]
         for entry in self.entries:
             if s >= entry.s:
@@ -83,6 +110,7 @@ class ElevationProfile:
                 break
 
         ds = s - active_entry.s
+        # z(ds) = a + b*ds + c*ds^2 + d*ds^3
         return (
             active_entry.a
             + active_entry.b * ds
@@ -103,12 +131,13 @@ class LaneOffsetEntry:
 
 
 class LaneOffsetProfile:
-    """Manages multiple laneOffset entries and evaluates lateral offset at any s."""
+    """Manages lateral offset of the entire lane group from the reference line."""
 
     def __init__(self, entries: List[LaneOffsetEntry]):
         self.entries = sorted(entries, key=lambda e: e.s)
 
     def get_offset(self, s: float) -> float:
+        """Evaluates the lateral offset at position s."""
         if not self.entries:
             return 0.0
 
@@ -157,6 +186,7 @@ class SuperelevationProfile:
         self.entries = sorted(entries, key=lambda e: e.s)
 
     def get_value(self, s: float) -> float:
+        """Returns the superelevation angle in radians at position s."""
         if not self.entries:
             return 0.0
         active = self.entries[0]
@@ -171,6 +201,7 @@ class SuperelevationProfile:
 
 @dataclass
 class CrossfallEntry:
+    """Represents a lateral slope angle record."""
     s: float
     a: float
     b: float
@@ -180,12 +211,17 @@ class CrossfallEntry:
 
 
 class CrossfallProfile:
-    """Evaluates crossfall (lateral slope angle) at any s position."""
+    """Evaluates crossfall (lateral slope angle) at any s position.
+    
+    Crossfall is used to drain water from the road surface and is applied
+    independently to the left or right sides.
+    """
 
     def __init__(self, entries: List[CrossfallEntry]):
         self.entries = sorted(entries, key=lambda e: e.s)
 
     def get_crossfall(self, s: float, is_left_lane: bool) -> float:
+        """Returns the crossfall angle in radians for a specific side."""
         if not self.entries:
             return 0.0
         active = self.entries[0]
@@ -194,16 +230,23 @@ class CrossfallProfile:
                 active = entry
             else:
                 break
+        
+        # Check if this profile applies to the requested side
         if active.side == "left" and not is_left_lane:
             return 0.0
         if active.side == "right" and is_left_lane:
             return 0.0
+            
         ds = s - active.s
         return active.a + active.b * ds + active.c * ds**2 + active.d * ds**3
 
 
 class XodrParser:
-    """A minimal OpenDRIVE (XODR) parser for visualization purposes."""
+    """A minimal OpenDRIVE (XODR) parser for visualization purposes.
+    
+    This parser extracts road geometries and lane structures, performing the 
+    necessary coordinate transformations to generate 3D meshes.
+    """
 
     def __init__(self, file_path: str):
         """Initialize parser from file path."""
@@ -216,7 +259,7 @@ class XodrParser:
         lanes_to_render = []
         road_links = []
 
-        # First pass: collect reference line endpoints per road
+        # First pass: collect reference line endpoints per road to resolve connectivity
         road_ref_endpoints: dict = {}
         for road in self.root.findall("road"):
             road_id = road.get("id", "unknown")
@@ -227,20 +270,18 @@ class XodrParser:
         for road in self.root.findall("road"):
             road_id = road.get("id", "unknown")
 
-            # 1. Parse Elevation Profile
+            # 1. Parse Profiles (Elevation, Superelevation, Crossfall)
             elevation_profile = self._parse_elevation_profile(road)
-
-            # 1b. Parse Lateral Profile (superelevation + crossfall)
             superelevation_profile, crossfall_profile = self._parse_lateral_profile(road)
 
-            # 2. Parse Reference Line (planView) — returns (Point3D, s) pairs
+            # 2. Parse Reference Line (planView) — returns (Point3D, s) pairs sampled along segments
             ref_line_with_s = self._parse_plan_view(
                 road, elevation_profile=elevation_profile
             )
             if not ref_line_with_s:
                 continue
 
-            # 3. Parse successor link
+            # 3. Parse road connectivity (successor links)
             link_tag = road.find("link")
             if link_tag is not None:
                 succ_tag = link_tag.find("successor")
@@ -266,7 +307,7 @@ class XodrParser:
             if lanes is None:
                 continue
 
-            # Parse laneOffset profile (Fix 2)
+            # Parse laneOffset profile (applies lateral shift to all lanes)
             lane_offset_profile = self._parse_lane_offset_profile(lanes)
 
             # Inject section-boundary points into the ref line so every section
@@ -278,7 +319,7 @@ class XodrParser:
                 ref_line_with_s, boundary_s_values
             )
 
-            # Process all lane sections (Fix 1: multiple lane sections per road)
+            # Process all lane sections within the road
             lane_sections = lanes.findall("laneSection")
             if not lane_sections:
                 continue
@@ -291,7 +332,7 @@ class XodrParser:
                     else math.inf
                 )
 
-                # Slice reference line points for this section
+                # Slice reference line points for this specific section
                 section_pts_with_s = [
                     (pt, s) for pt, s in ref_line_with_s if s0 <= s <= s1
                 ]
@@ -301,10 +342,10 @@ class XodrParser:
                 ref_pts = [pt for pt, _ in section_pts_with_s]
                 s_vals = [s for _, s in section_pts_with_s]
 
-                # Compute lane offset at each s point (Fix 2)
+                # Compute lane offset at each sampled s point
                 lane_offsets = [lane_offset_profile.get_offset(s) for s in s_vals]
 
-                # Process left lanes: IDs are positive, sorted ascending (innermost first)
+                # Process left lanes (OpenDRIVE IDs are positive, build outward from center)
                 left = lane_section.find("left")
                 if left is not None:
                     left_lanes = sorted(
@@ -333,7 +374,7 @@ class XodrParser:
                             lanes_to_render.append(parsed_lane)
                         inner_offsets = outer_offsets
 
-                # Process right lanes: IDs are negative, sorted ascending by magnitude
+                # Process right lanes (OpenDRIVE IDs are negative, build outward)
                 right = lane_section.find("right")
                 if right is not None:
                     right_lanes = sorted(
@@ -383,9 +424,10 @@ class XodrParser:
     def _get_lane_widths_at_s(
         self, lane_tag: ET.Element, s_vals: List[float], section_s0: float
     ) -> List[float]:
-        """Return lane width at each s position, evaluating the cubic polynomial. (Fix 4)"""
+        """Return lane width at each s position, evaluating the cubic polynomial width profile."""
         width_tags = lane_tag.findall("width")
         if not width_tags:
+            # Default to 3m if no width records are present
             return [3.0] * len(s_vals)
 
         entries = sorted(
@@ -470,7 +512,11 @@ class XodrParser:
         step_size: float = 2.0,
         elevation_profile: Optional[ElevationProfile] = None,
     ) -> List[Tuple[Point3D, float]]:
-        """Parse the reference line geometries into a list of (Point3D, s) pairs."""
+        """Parse the reference line geometries into a list of (Point3D, s) pairs.
+        
+        This samples the geometric primitives (lines, arcs, spirals, polynomials) 
+        along their length to create a discrete sequence of points.
+        """
         plan_view = road.find("planView")
         if plan_view is None:
             return []
@@ -486,9 +532,10 @@ class XodrParser:
             def _z(s: float) -> float:
                 return elevation_profile.get_z(s) if elevation_profile else 0.0
 
-            # Skip duplicate start point for all segments after the first
+            # Skip duplicate start point if this isn't the first segment of the road
             skip_first = len(pts) > 0
 
+            # ---------- Line Geometry ----------
             if geom.find("line") is not None:
                 num_steps = max(2, int(length / step_size))
                 for i in range(num_steps + 1):
@@ -507,6 +554,7 @@ class XodrParser:
                         )
                     )
 
+            # ---------- Arc Geometry (Constant Curvature) ----------
             elif geom.find("arc") is not None:
                 arc = geom.find("arc")
                 curvature = float(arc.get("curvature", 0))
@@ -528,8 +576,9 @@ class XodrParser:
                         y = cy + radius * math.sin(theta)
                     pts.append((Point3D(x, y, _z(s_curr)), s_curr))
 
+            # ---------- Spiral Geometry (Clothoid / Euler Spiral) ----------
             elif geom.find("spiral") is not None:
-                # Fix 3: Clothoid / Euler spiral via numerical integration
+                # Curvature varies linearly with arc length: kappa(s) = k0 + ds * (dk/ds)
                 spiral = geom.find("spiral")
                 curv_start = float(spiral.get("curvStart", 0))
                 curv_end = float(spiral.get("curvEnd", 0))
@@ -543,7 +592,7 @@ class XodrParser:
                             pts.append((Point3D(x, y, _z(s_start)), s_start))
                         continue
                     ds_prev = (i - 1) * ds_step
-                    # Use midpoint curvature for heading integration (midpoint rule)
+                    # Use midpoint rule for numerical integration of the spiral
                     ds_mid = ds_prev + ds_step / 2.0
                     h_mid = hdg + curv_start * ds_mid + 0.5 * dcurv * ds_mid**2
                     x += ds_step * math.cos(h_mid)
@@ -551,8 +600,9 @@ class XodrParser:
                     s_curr = s_start + i * ds_step
                     pts.append((Point3D(x, y, _z(s_curr)), s_curr))
 
+            # ---------- Parametric Cubic Polynomial Geometry ----------
             elif geom.find("paramPoly3") is not None:
-                # Fix 3: Parametric cubic polynomial
+                # Defines x(p) and y(p) as cubic polynomials of parameter p
                 pp3 = geom.find("paramPoly3")
                 aU = float(pp3.get("aU", 0))
                 bU = float(pp3.get("bU", 0))
@@ -572,6 +622,7 @@ class XodrParser:
                     p = t * length if p_range == "arcLength" else t
                     u = aU + bU * p + cU * p**2 + dU * p**3
                     v = aV + bV * p + cV * p**2 + dV * p**3
+                    # Rotate local (u, v) coordinates by segment heading
                     x = x0 + u * cos_h - v * sin_h
                     y = y0 + u * sin_h + v * cos_h
                     s_curr = s_start + t * length
@@ -591,14 +642,21 @@ class XodrParser:
         superelevation_profile: "SuperelevationProfile",
         crossfall_profile: "CrossfallProfile",
     ) -> Optional[Lane]:
-        """Create a Lane using 3D orthonormal frame (e_s, e_t, e_h) per point.
+        """Constructs a 3D Lane object from road geometry and lateral profiles.
 
-        Mirrors Road::get_xyz() and Road::get_surface_pt() in libOpenDRIVE.
+        This function calculates the exact 3D position of lane boundaries and 
+        centerlines by applying lateral offsets (t), superelevation (roll), 
+        and crossfall to the road's reference line.
+
+        Coordinate System:
+          - e_s: Unit tangent vector (longitudinal direction).
+          - e_t: Unit lateral vector (horizontal direction, with roll).
+          - e_h: Unit vertical vector (upwards normal).
         """
         lane_id = lane_tag.get("id", "0")
         lane_type = lane_tag.get("type", "driving")
 
-        # Only render drivable and pedestrian lane types
+        # Only render drivable and pedestrian-relevant lane types
         if lane_type not in ["driving", "sidewalk", "biking", "shoulder"]:
             return None
 
@@ -611,25 +669,24 @@ class XodrParser:
             s = s_vals[i]
             px, py, pz = ref_line[i].x, ref_line[i].y, ref_line[i].z
 
-            # 3D tangent (e_s) via central difference, elevation already in ref Z
+            # 1. Compute local orthonormal frame (e_s, e_t, e_h)
             e_s = _compute_3d_tangent(ref_line, i)
-
-            # Lateral unit vector (e_t) with superelevation
             theta = superelevation_profile.get_value(s)
             e_t = _compute_e_t(e_s, theta)
-
-            # Vertical unit vector (e_h) perpendicular to both e_s and e_t
             e_h = _normalize_3d(_cross_product(e_s, e_t))
 
+            # 2. Determine lateral offsets for inner, outer, and center paths
             io = inner_offsets[i]
             oo = outer_offsets[i]
             co = (io + oo) / 2.0
 
-            # Crossfall: h_t = -tan(crossfall) * |t|
+            # 3. Apply Crossfall: h_t = -tan(crossfall) * |t|
+            # This creates a slight lateral slope for drainage.
             crossfall = crossfall_profile.get_crossfall(s, is_left)
             tan_cf = math.tan(crossfall)
 
             def _make_pt(t_offset: float) -> Point3D:
+                """Projects a point from the reference line using local coordinates."""
                 h_t = -tan_cf * abs(t_offset)
                 return Point3D(
                     px + e_t[0] * t_offset + e_h[0] * h_t,
@@ -641,8 +698,7 @@ class XodrParser:
             inner_pts.append(_make_pt(io))
             outer_pts.append(_make_pt(oo))
 
-        # Left lanes: outer edge is the left boundary, inner edge is the right boundary
-        # Right lanes: inner edge (closer to center) is the left boundary, outer is right
+        # Determine Left/Right boundaries based on lane side (OpenDRIVE orientation)
         if is_left:
             lb_left = LaneBoundary(
                 id=f"{road_id}_{lane_id}_left", style="solid", points=outer_pts
@@ -673,10 +729,10 @@ def _insert_boundary_points(
     ref_line_with_s: List[Tuple[Point3D, float]],
     boundary_s_values: List[float],
 ) -> List[Tuple[Point3D, float]]:
-    """Insert interpolated (Point3D, s) entries at each boundary s-value.
+    """Ensures that lane section boundaries are explicitly represented in the ref line.
 
-    Guarantees that every value in boundary_s_values appears in the returned
-    list, so adjacent lane sections share an exact boundary point.
+    This prevents geometric "seams" or gaps between adjacent lane sections by 
+    interpolating and inserting points at the exact s-coordinates where sections start/end.
     """
     result = list(ref_line_with_s)
     insert_offset = 0
@@ -688,9 +744,11 @@ def _insert_boundary_points(
             break
         if abs(result[j][1] - s_target) < 1e-9:
             insert_offset = j + 1
-            continue  # already present
+            continue  # point is already present
         if j == 0:
-            continue  # before road start; skip
+            continue  # target is before road start; skip
+            
+        # Interpolate between result[j-1] and result[j]
         pt_a, s_a = result[j - 1]
         pt_b, s_b = result[j]
         t = (s_target - s_a) / (s_b - s_a)
@@ -705,6 +763,6 @@ def _insert_boundary_points(
 
 
 def parse_xodr(file_path: str) -> XodrMapData:
-    """Convenience function to parse an XODR file."""
+    """Convenience function to parse an OpenDRIVE file into a map model."""
     parser = XodrParser(file_path)
     return parser.parse()
