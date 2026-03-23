@@ -26,11 +26,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the JSON or JSONL object log file.",
     )
     parser.add_argument(
-        "--meta",
-        dest="meta_path",
-        help="Optional path to a metadata JSON file containing sim/xodr_enu transforms.",
-    )
-    parser.add_argument(
         "--application-id",
         default="log_viewer",
         help="Rerun application id used for the viewer session.",
@@ -49,14 +44,12 @@ def main() -> None:
         raise FileNotFoundError(f"Map file not found: {map_path}")
     if not log_path.is_file():
         raise FileNotFoundError(f"Log file not found: {log_path}")
-    if args.meta_path and not Path(args.meta_path).is_file():
-        raise FileNotFoundError(f"Metadata file not found: {args.meta_path}")
 
     print(f"Loading map from: {map_path}")
     map_data = parse_xodr(str(map_path))
 
     print(f"Loading log from: {log_path}")
-    frames = parse_log(str(log_path), meta_file_path=args.meta_path)
+    frames = parse_log(str(log_path))
 
     viewer = LogViewer(application_id=args.application_id)
     viewer.init_xodr(map_data)
