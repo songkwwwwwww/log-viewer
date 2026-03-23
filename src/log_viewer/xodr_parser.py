@@ -7,6 +7,50 @@ from .geometry import Point3D
 from .map_model import Lane, LaneBoundary, RoadLink, XodrMapData
 
 
+def _normalize_3d(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    n = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+    if n == 0:
+        return (0.0, 0.0, 1.0)
+    return (v[0] / n, v[1] / n, v[2] / n)
+
+
+def _cross_product(
+    a: Tuple[float, float, float], b: Tuple[float, float, float]
+) -> Tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _compute_3d_tangent(
+    ref_line: List[Point3D], i: int
+) -> Tuple[float, float, float]:
+    """Central-difference 3D tangent along the reference line."""
+    n = len(ref_line)
+    p1 = ref_line[max(0, i - 1)]
+    p2 = ref_line[min(n - 1, i + 1)]
+    return _normalize_3d((p2.x - p1.x, p2.y - p1.y, p2.z - p1.z))
+
+
+def _compute_e_t(
+    e_s: Tuple[float, float, float], theta: float
+) -> Tuple[float, float, float]:
+    """Lateral unit vector accounting for superelevation angle theta.
+
+    Mirrors Road::get_xyz() in libOpenDRIVE/src/Road.cpp.
+    When theta=0 this reduces to the 2D left-pointing normal.
+    """
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    return _normalize_3d((
+        cos_t * -e_s[1] + sin_t * -e_s[2] * e_s[0],
+        cos_t *  e_s[0] + sin_t * -e_s[2] * e_s[1],
+        sin_t * (e_s[0] ** 2 + e_s[1] ** 2),
+    ))
+
+
 @dataclass
 class ElevationEntry:
     """Represents a single elevation record in a cubic polynomial profile."""
@@ -95,6 +139,69 @@ class WidthEntry:
     d: float
 
 
+@dataclass
+class SuperelevationEntry:
+    """Represents a single superelevation record (road banking angle, radians)."""
+
+    s: float
+    a: float
+    b: float
+    c: float
+    d: float
+
+
+class SuperelevationProfile:
+    """Evaluates road superelevation (roll angle) at any s position."""
+
+    def __init__(self, entries: List[SuperelevationEntry]):
+        self.entries = sorted(entries, key=lambda e: e.s)
+
+    def get_value(self, s: float) -> float:
+        if not self.entries:
+            return 0.0
+        active = self.entries[0]
+        for entry in self.entries:
+            if s >= entry.s:
+                active = entry
+            else:
+                break
+        ds = s - active.s
+        return active.a + active.b * ds + active.c * ds**2 + active.d * ds**3
+
+
+@dataclass
+class CrossfallEntry:
+    s: float
+    a: float
+    b: float
+    c: float
+    d: float
+    side: str  # "left", "right", or "both"
+
+
+class CrossfallProfile:
+    """Evaluates crossfall (lateral slope angle) at any s position."""
+
+    def __init__(self, entries: List[CrossfallEntry]):
+        self.entries = sorted(entries, key=lambda e: e.s)
+
+    def get_crossfall(self, s: float, is_left_lane: bool) -> float:
+        if not self.entries:
+            return 0.0
+        active = self.entries[0]
+        for entry in self.entries:
+            if s >= entry.s:
+                active = entry
+            else:
+                break
+        if active.side == "left" and not is_left_lane:
+            return 0.0
+        if active.side == "right" and is_left_lane:
+            return 0.0
+        ds = s - active.s
+        return active.a + active.b * ds + active.c * ds**2 + active.d * ds**3
+
+
 class XodrParser:
     """A minimal OpenDRIVE (XODR) parser for visualization purposes."""
 
@@ -122,6 +229,9 @@ class XodrParser:
 
             # 1. Parse Elevation Profile
             elevation_profile = self._parse_elevation_profile(road)
+
+            # 1b. Parse Lateral Profile (superelevation + crossfall)
+            superelevation_profile, crossfall_profile = self._parse_lateral_profile(road)
 
             # 2. Parse Reference Line (planView) — returns (Point3D, s) pairs
             ref_line_with_s = self._parse_plan_view(
@@ -205,7 +315,10 @@ class XodrParser:
                             ref_pts,
                             inner_offsets,
                             outer_offsets,
+                            s_vals,
                             is_left=True,
+                            superelevation_profile=superelevation_profile,
+                            crossfall_profile=crossfall_profile,
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
@@ -232,7 +345,10 @@ class XodrParser:
                             ref_pts,
                             inner_offsets,
                             outer_offsets,
+                            s_vals,
                             is_left=False,
+                            superelevation_profile=superelevation_profile,
+                            crossfall_profile=crossfall_profile,
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
@@ -307,6 +423,37 @@ class XodrParser:
                     )
                 )
         return ElevationProfile(entries)
+
+    def _parse_lateral_profile(
+        self, road: ET.Element
+    ) -> Tuple[SuperelevationProfile, CrossfallProfile]:
+        """Parse <lateralProfile> for superelevation and crossfall."""
+        superelev_entries = []
+        crossfall_entries = []
+        lateral_tag = road.find("lateralProfile")
+        if lateral_tag is not None:
+            for se in lateral_tag.findall("superelevation"):
+                superelev_entries.append(
+                    SuperelevationEntry(
+                        s=float(se.get("s", 0)),
+                        a=float(se.get("a", 0)),
+                        b=float(se.get("b", 0)),
+                        c=float(se.get("c", 0)),
+                        d=float(se.get("d", 0)),
+                    )
+                )
+            for cf in lateral_tag.findall("crossFall"):
+                crossfall_entries.append(
+                    CrossfallEntry(
+                        s=float(cf.get("s", 0)),
+                        a=float(cf.get("a", 0)),
+                        b=float(cf.get("b", 0)),
+                        c=float(cf.get("c", 0)),
+                        d=float(cf.get("d", 0)),
+                        side=cf.get("side", "both"),
+                    )
+                )
+        return SuperelevationProfile(superelev_entries), CrossfallProfile(crossfall_entries)
 
     def _parse_plan_view(
         self,
@@ -430,9 +577,15 @@ class XodrParser:
         ref_line: List[Point3D],
         inner_offsets: List[float],
         outer_offsets: List[float],
+        s_vals: List[float],
         is_left: bool,
+        superelevation_profile: "SuperelevationProfile",
+        crossfall_profile: "CrossfallProfile",
     ) -> Optional[Lane]:
-        """Create a Lane using per-point inner/outer cumulative offsets."""
+        """Create a Lane using 3D orthonormal frame (e_s, e_t, e_h) per point.
+
+        Mirrors Road::get_xyz() and Road::get_surface_pt() in libOpenDRIVE.
+        """
         lane_id = lane_tag.get("id", "0")
         lane_type = lane_tag.get("type", "driving")
 
@@ -440,33 +593,44 @@ class XodrParser:
         if lane_type not in ["driving", "sidewalk", "biking", "shoulder"]:
             return None
 
-        # For right lanes the offsets are already negative (built outward in -normal dir)
-        # We use abs and the sign to reconstruct actual lateral displacement
         center_pts = []
         inner_pts = []
         outer_pts = []
 
         n = len(ref_line)
         for i in range(n):
-            p1 = ref_line[max(0, i - 1)]
-            p2 = ref_line[min(n - 1, i + 1)]
-
-            dx = p2.x - p1.x
-            dy = p2.y - p1.y
-            norm = math.hypot(dx, dy)
-            if norm == 0:
-                nx, ny = 0.0, 1.0
-            else:
-                nx, ny = -dy / norm, dx / norm  # Left-pointing normal
-
+            s = s_vals[i]
             px, py, pz = ref_line[i].x, ref_line[i].y, ref_line[i].z
+
+            # 3D tangent (e_s) via central difference, elevation already in ref Z
+            e_s = _compute_3d_tangent(ref_line, i)
+
+            # Lateral unit vector (e_t) with superelevation
+            theta = superelevation_profile.get_value(s)
+            e_t = _compute_e_t(e_s, theta)
+
+            # Vertical unit vector (e_h) perpendicular to both e_s and e_t
+            e_h = _normalize_3d(_cross_product(e_s, e_t))
+
             io = inner_offsets[i]
             oo = outer_offsets[i]
             co = (io + oo) / 2.0
 
-            center_pts.append(Point3D(px + nx * co, py + ny * co, pz))
-            inner_pts.append(Point3D(px + nx * io, py + ny * io, pz))
-            outer_pts.append(Point3D(px + nx * oo, py + ny * oo, pz))
+            # Crossfall: h_t = -tan(crossfall) * |t|
+            crossfall = crossfall_profile.get_crossfall(s, is_left)
+            tan_cf = math.tan(crossfall)
+
+            def _make_pt(t_offset: float) -> Point3D:
+                h_t = -tan_cf * abs(t_offset)
+                return Point3D(
+                    px + e_t[0] * t_offset + e_h[0] * h_t,
+                    py + e_t[1] * t_offset + e_h[1] * h_t,
+                    pz + e_t[2] * t_offset + e_h[2] * h_t,
+                )
+
+            center_pts.append(_make_pt(co))
+            inner_pts.append(_make_pt(io))
+            outer_pts.append(_make_pt(oo))
 
         # Left lanes: outer edge is the left boundary, inner edge is the right boundary
         # Right lanes: inner edge (closer to center) is the left boundary, outer is right
