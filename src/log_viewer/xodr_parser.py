@@ -269,6 +269,15 @@ class XodrParser:
             # Parse laneOffset profile (Fix 2)
             lane_offset_profile = self._parse_lane_offset_profile(lanes)
 
+            # Inject section-boundary points into the ref line so every section
+            # starts and ends at a precisely-sampled point (seam fix).
+            boundary_s_values = sorted(
+                float(ls.get("s", 0.0)) for ls in lanes.findall("laneSection")
+            )
+            ref_line_with_s = _insert_boundary_points(
+                ref_line_with_s, boundary_s_values
+            )
+
             # Process all lane sections (Fix 1: multiple lane sections per road)
             lane_sections = lanes.findall("laneSection")
             if not lane_sections:
@@ -658,6 +667,41 @@ class XodrParser:
             center_line=center_pts,
             is_left=is_left,
         )
+
+
+def _insert_boundary_points(
+    ref_line_with_s: List[Tuple[Point3D, float]],
+    boundary_s_values: List[float],
+) -> List[Tuple[Point3D, float]]:
+    """Insert interpolated (Point3D, s) entries at each boundary s-value.
+
+    Guarantees that every value in boundary_s_values appears in the returned
+    list, so adjacent lane sections share an exact boundary point.
+    """
+    result = list(ref_line_with_s)
+    insert_offset = 0
+    for s_target in sorted(boundary_s_values):
+        j = insert_offset
+        while j < len(result) and result[j][1] < s_target:
+            j += 1
+        if j >= len(result):
+            break
+        if abs(result[j][1] - s_target) < 1e-9:
+            insert_offset = j + 1
+            continue  # already present
+        if j == 0:
+            continue  # before road start; skip
+        pt_a, s_a = result[j - 1]
+        pt_b, s_b = result[j]
+        t = (s_target - s_a) / (s_b - s_a)
+        pt_new = Point3D(
+            pt_a.x + t * (pt_b.x - pt_a.x),
+            pt_a.y + t * (pt_b.y - pt_a.y),
+            pt_a.z + t * (pt_b.z - pt_a.z),
+        )
+        result.insert(j, (pt_new, s_target))
+        insert_offset = j + 1
+    return result
 
 
 def parse_xodr(file_path: str) -> XodrMapData:
