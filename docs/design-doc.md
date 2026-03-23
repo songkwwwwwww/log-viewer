@@ -24,11 +24,12 @@ The primary goal of this tool is to provide an intuitive 3D viewer for analyzing
      - Construct a `SceneFrame` object for each frame in a main loop and call the `render_state(...)` API directly.
   2. **Log Replay Mode (File Replay)**
      - Read specified log files (JSON/JSONL) to assemble full frame data and replay via the UI.
+     - Invoked via the `replay_log` CLI entry point (`--map`, `--log` arguments).
 
 ### 2.2 Secondary Goals
 - Visualization of past/future trajectory lines per object.
 - Camera controls (Zoom, Pan, Orbit, Top View / 3D Perspective View toggle).
-- Detailed state inspection (speed, acceleration, etc.) when clicking an object.
+- Detailed state inspection (speed, acceleration, position, velocity) when clicking an object.
 
 ### 2.3 Non-goals (Initial Version)
 - Vehicle dynamics simulation or control logic.
@@ -74,13 +75,12 @@ The system consists of a data processing layer (Parser), a control layer (Core A
  +--------------------+      +--------------------+
  |     LogParser      |      |     XodrParser     |
  +--------------------+      +--------------------+
-           | ('SceneFrame')             | ('Lanes', 'Boundaries')
+           | ('SceneFrame')             | ('XodrMapData')
            v                            v
  +======================================================+
  |                   LogViewer Core                     |
- |  - init_xodr(map_data, transform_matrix=None)        |
+ |  - init_xodr(map_data)                               |
  |  - render_state(frame)                               |
- |  - load_log(file_path)                               |
  +======================================================+
                            |  (Rerun Python API)
                            v
@@ -88,22 +88,36 @@ The system consists of a data processing layer (Parser), a control layer (Core A
  |        Visualization Engine (Rerun Viewer)           |
  |  - 3D Renderer (Map & Object BBox)                   |
  |  - Timeline Controller (Play/Pause/Scrub)            |
+ |  - Time Series Panels (Speed, Position, Velocity)    |
  +======================================================+
 ```
 
-1. **XodrParser**: Parses OpenDRIVE format and extracts only geometry for visualization (Lane, Boundary coordinates).
-2. **LogParser**: Reads historical logs and organizes them by timestamp into `SceneFrame` structures.
-   - Optionally loads a sidecar metadata JSON file containing a global transform from `sim` to `xodr_enu`.
-3. **LogViewer Core**: The main public API; pushes real-time data via `render_state()` or uploads full datasets to the visualization engine via `load_log()`.
-4. **Visualization Engine**: The Rerun Viewer process handles the actual rendering and playback controls.
+```text
+  [ CLI: replay_log ]
+    --map  --log
+           |
+           v
+ +--------------------+      +--------------------+
+ |     parse_xodr()   |      |     parse_log()     |
+ +--------------------+      +--------------------+
+           |                            |
+           +------------+---------------+
+                        v
+               [ LogViewer.init_xodr()
+                 LogViewer.render_state() ]
+```
+
+1. **XodrParser**: Parses OpenDRIVE format and extracts only geometry for visualization (Lane, Boundary coordinates). Supports lane offsets, variable widths, elevation profiles, superelevation, and spiral/arc geometry.
+2. **LogParser**: Reads historical logs and organizes them by timestamp into `SceneFrame` structures. Supports JSON arrays and JSON Lines (JSONL) formats.
+3. **LogViewer Core**: The main public API; pushes real-time data via `render_state()`, or a full dataset can be replayed via the `replay_log` CLI.
+4. **Visualization Engine**: The Rerun Viewer process handles the actual rendering and playback controls, including time-series panels for speed, acceleration, position, and velocity.
 
 ---
 
 ## 5. Detailed Data Model
 
-Uses a Cartesian coordinate system (X, Y, Z, Quaternions). XODR visualization begins by transforming lane and boundary geometry data.
+Uses a Cartesian coordinate system (X, Y, Z, Quaternions). The data model is split by responsibility:
 
-For implementation, the data model is split by responsibility:
 - `geometry.py`: shared primitives such as `Point3D` and `Quaternion`
 - `map_model.py`: OpenDRIVE-derived map structures
 - `scene_model.py`: logged dynamic object and frame structures
@@ -180,7 +194,7 @@ class ObjectState:
     acceleration: Point3D                    # (ax, ay, az)
     orientation: Quaternion                  # rotation in 3D (w, x, y, z)
     size: Tuple[float, float, float]         # Bounding Box dimensions (length, width, height)
-    future_trajectory: List[PoseAtTime]      # (Optional) predicted/planned trajectory
+    future_trajectory: Optional[List[PoseAtTime]] = None  # predicted/planned trajectory
 
 @dataclass
 class SceneFrame:
@@ -220,33 +234,13 @@ Standard structure for frame-by-frame logging. Supports JSON arrays or JSON Line
 
 - **JSON Lines (.jsonl)**: For very large logs, `.jsonl` is more efficient than a single massive array.
 
-### 5.5 Optional Metadata Sidecar Format
-
-When log coordinates in the `sim` frame need to be aligned to the map's `xodr_enu` frame, an optional metadata JSON file can be provided alongside the log.
-
-```json
-{
-  "sim_to_xodr_enu": [
-    [1.0, 0.0, 0.0, 10.0],
-    [0.0, 1.0, 0.0, 20.0],
-    [0.0, 0.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0]
-  ]
-}
-```
-
-- Preferred key: `sim_to_xodr_enu`
-- Alternative key: `xodr_enu_to_sim` and invert it internally
-- The resulting `sim -> xodr_enu` matrix is applied to object positions and future trajectory positions while parsing the log.
-- This metadata is optional and intended for a single global transform shared by the entire log.
-
 ---
 
 ## 6. Risks & Future Work
 
 1. **Coordinate System Alignment**
    - XODR map coordinates may differ from external log data (e.g., ENU, NED, or local frames).
-   - *Mitigation*: Allow an optional metadata sidecar file to provide a global `sim -> xodr_enu` 4x4 transform applied while parsing the log.
+   - *Mitigation*: Coordinate transform support can be added as a preprocessing step before passing data to `LogViewer`.
 2. **Geometry Vertex Overhead**
    - Rendering vast XODR maps as dense `Point3D` sets can be resource-intensive.
    - *Mitigation*: Implement dynamic sampling based on distance (LOD) or cache static meshes on initial load.
