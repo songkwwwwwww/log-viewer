@@ -33,7 +33,7 @@ _OBJECT_COLORS = {
 
 class LogViewer:
     """Core Log Viewer class using rerun-sdk for 3D visualization.
-    
+
     This class handles the initialization of the Rerun viewer, the layout
     of the visualization workspace (blueprint), and the logging of
     static map data and dynamic simulation frames.
@@ -98,11 +98,8 @@ class LogViewer:
         )
         # Initialize Rerun and spawn the viewer window
         rr.init(application_id, spawn=True, default_blueprint=blueprint)
-        self.transform_matrix = None
 
-    def init_xodr(
-        self, map_data: XodrMapData, transform_matrix: Optional[np.ndarray] = None
-    ):
+    def init_xodr(self, map_data: XodrMapData):
         """Initialize and log the OpenDRIVE map in the viewer.
 
         Iterates through all parsed lanes and logs them as 3D meshes (surfaces),
@@ -110,10 +107,7 @@ class LogViewer:
 
         Args:
             map_data: Parsed XODR map data containing lanes and boundaries.
-            transform_matrix: Optional 4x4 homogeneous transform to convert
-                from the XODR coordinate frame to the desired display frame.
         """
-        self.transform_matrix = transform_matrix
 
         for lane in map_data.lanes:
             # Each lane is logged under a unique entity path hierarchy
@@ -155,7 +149,7 @@ class LogViewer:
                         road_id=lane.road_id,
                         lane_type=lane.type,
                     ),
-                    static=True, # Map data is static across all time
+                    static=True,  # Map data is static across all time
                 )
 
             # ---------- 2. Lane boundaries (LineStrips3D) ----------
