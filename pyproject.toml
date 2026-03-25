@@ -7,9 +7,9 @@ name = "log_viewer"
 version = "0.1.0"
 description = "Log Viewer based on OpenDRIVE and Rerun SDK"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-    "rerun-sdk>=0.15.0",
+    "rerun-sdk==0.30.2",
     "numpy>=1.20.0",
     "scipy>=1.7.0",
 ]

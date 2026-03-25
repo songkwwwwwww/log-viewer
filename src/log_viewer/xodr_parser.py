@@ -22,6 +22,10 @@ from typing import List, Optional, Tuple
 from .geometry import Point3D
 from .map_model import Lane, LaneBoundary, RoadLink, XodrMapData
 
+# Linearization tolerance (metres) used for adaptive sampling — mirrors the eps
+# value passed to libOpenDRIVE's approximate_linear() calls.
+_SAMPLING_EPS = 0.1
+
 
 def _normalize_3d(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
     """Normalizes a 3D vector to unit length."""
@@ -85,9 +89,55 @@ class ElevationEntry:
     d: float
 
 
+def _cubic_poly_sample_s_values(
+    s_entry: float,
+    s_entry_end: float,
+    c: float,
+    d: float,
+    s_start: float,
+    s_end: float,
+    eps: float,
+) -> List[float]:
+    """Compute s-values needing explicit samples within a cubic polynomial segment.
+
+    Mirrors libOpenDRIVE CubicPoly::approximate_linear logic:
+    - Linear (c==0, d==0): only endpoints needed.
+    - Quadratic (d==0, c!=0): uniform steps of 2*sqrt(|eps/c|).
+    - Cubic: subdivide segment into ~10 uniform steps as a practical approximation.
+
+    Returns s-values clipped to [s_start, s_end].
+    """
+    seg_s_start = max(s_entry, s_start)
+    seg_s_end = min(s_entry_end, s_end)
+    if seg_s_end <= seg_s_start:
+        return []
+
+    result = [seg_s_start, seg_s_end]
+
+    if d == 0.0 and c == 0.0:
+        pass  # linear — endpoints suffice
+    elif d == 0.0 and c != 0.0:
+        # quadratic: step derived from curvature tolerance
+        step = 2.0 * math.sqrt(abs(eps / c)) if abs(c) > 1e-12 else (seg_s_end - seg_s_start)
+        s = seg_s_start + step
+        while s < seg_s_end:
+            result.append(s)
+            s += step
+    else:
+        # cubic: ~10 uniform subdivisions as a practical approximation
+        n = max(2, int((seg_s_end - seg_s_start) / (10.0 * eps)))
+        step = (seg_s_end - seg_s_start) / n
+        s = seg_s_start + step
+        while s < seg_s_end:
+            result.append(s)
+            s += step
+
+    return result
+
+
 class ElevationProfile:
     """Manages multiple elevation entries and evaluates Z at any s position.
-    
+
     Elevation is defined as a sequence of cubic polynomials relative to the
     longitudinal position s.
     """
@@ -117,6 +167,24 @@ class ElevationProfile:
             + active_entry.c * ds**2
             + active_entry.d * ds**3
         )
+
+    def get_sample_s_values(
+        self, s_start: float, s_end: float, eps: float
+    ) -> List[float]:
+        """Return s-values where this profile needs explicit sampling.
+
+        Mirrors libOpenDRIVE CubicProfile::approximate_linear.
+        """
+        s_set: set = set()
+        s_set.add(s_start)
+        s_set.add(s_end)
+        entries = self.entries
+        for i, entry in enumerate(entries):
+            next_s = entries[i + 1].s if i + 1 < len(entries) else math.inf
+            s_set.update(
+                _cubic_poly_sample_s_values(entry.s, next_s, entry.c, entry.d, s_start, s_end, eps)
+            )
+        return sorted(v for v in s_set if s_start <= v <= s_end)
 
 
 @dataclass
@@ -155,6 +223,21 @@ class LaneOffsetProfile:
             + active_entry.c * ds**2
             + active_entry.d * ds**3
         )
+
+    def get_sample_s_values(
+        self, s_start: float, s_end: float, eps: float
+    ) -> List[float]:
+        """Return s-values where this profile needs explicit sampling."""
+        s_set: set = set()
+        s_set.add(s_start)
+        s_set.add(s_end)
+        entries = self.entries
+        for i, entry in enumerate(entries):
+            next_s = entries[i + 1].s if i + 1 < len(entries) else math.inf
+            s_set.update(
+                _cubic_poly_sample_s_values(entry.s, next_s, entry.c, entry.d, s_start, s_end, eps)
+            )
+        return sorted(v for v in s_set if s_start <= v <= s_end)
 
 
 @dataclass
@@ -197,6 +280,21 @@ class SuperelevationProfile:
                 break
         ds = s - active.s
         return active.a + active.b * ds + active.c * ds**2 + active.d * ds**3
+
+    def get_sample_s_values(
+        self, s_start: float, s_end: float, eps: float
+    ) -> List[float]:
+        """Return s-values where this profile needs explicit sampling."""
+        s_set: set = set()
+        s_set.add(s_start)
+        s_set.add(s_end)
+        entries = self.entries
+        for i, entry in enumerate(entries):
+            next_s = entries[i + 1].s if i + 1 < len(entries) else math.inf
+            s_set.update(
+                _cubic_poly_sample_s_values(entry.s, next_s, entry.c, entry.d, s_start, s_end, eps)
+            )
+        return sorted(v for v in s_set if s_start <= v <= s_end)
 
 
 @dataclass
@@ -310,13 +408,40 @@ class XodrParser:
             # Parse laneOffset profile (applies lateral shift to all lanes)
             lane_offset_profile = self._parse_lane_offset_profile(lanes)
 
-            # Inject section-boundary points into the ref line so every section
-            # starts and ends at a precisely-sampled point (seam fix).
-            boundary_s_values = sorted(
-                float(ls.get("s", 0.0)) for ls in lanes.findall("laneSection")
+            # Collect all s-values that need explicit sampling:
+            # lane section boundaries + lane_offset/superelevation change-points
+            # + per-lane width entry boundaries.
+            # Mirrors libOpenDRIVE Road::get_lane_mesh s-value union strategy.
+            road_s_start = ref_line_with_s[0][1]
+            road_s_end = ref_line_with_s[-1][1]
+            extra_s: set = set()
+
+            # Lane section boundaries
+            for ls in lanes.findall("laneSection"):
+                extra_s.add(float(ls.get("s", 0.0)))
+
+            # Lane offset profile change-points
+            extra_s.update(
+                lane_offset_profile.get_sample_s_values(road_s_start, road_s_end, _SAMPLING_EPS)
             )
+
+            # Superelevation change-points
+            extra_s.update(
+                superelevation_profile.get_sample_s_values(road_s_start, road_s_end, _SAMPLING_EPS)
+            )
+
+            # Width entry boundary s-values for every lane in every lane section
+            for ls in lanes.findall("laneSection"):
+                ls_s0 = float(ls.get("s", 0.0))
+                for side in (ls.find("left"), ls.find("right")):
+                    if side is None:
+                        continue
+                    for lane_tag in side.findall("lane"):
+                        for wt in lane_tag.findall("width"):
+                            extra_s.add(ls_s0 + float(wt.get("sOffset", 0.0)))
+
             ref_line_with_s = _insert_boundary_points(
-                ref_line_with_s, boundary_s_values
+                ref_line_with_s, sorted(extra_s)
             )
 
             # Process all lane sections within the road
@@ -326,16 +451,27 @@ class XodrParser:
 
             for idx, lane_section in enumerate(lane_sections):
                 s0 = float(lane_section.get("s", 0.0))
+                is_last_section = idx + 1 >= len(lane_sections)
                 s1 = (
                     float(lane_sections[idx + 1].get("s", math.inf))
-                    if idx + 1 < len(lane_sections)
+                    if not is_last_section
                     else math.inf
                 )
 
-                # Slice reference line points for this specific section
-                section_pts_with_s = [
-                    (pt, s) for pt, s in ref_line_with_s if s0 <= s <= s1
-                ]
+                # Slice reference line points for this section.
+                # Include [s0, s1] so the section has a proper end vertex at the
+                # boundary. The boundary point at s == s1 is evaluated using this
+                # section's width polynomial (section_s0-relative), which is
+                # correct because width polynomials are defined up to the next
+                # section boundary. The last section uses s0 <= s.
+                if is_last_section:
+                    section_pts_with_s = [
+                        (pt, s) for pt, s in ref_line_with_s if s >= s0
+                    ]
+                else:
+                    section_pts_with_s = [
+                        (pt, s) for pt, s in ref_line_with_s if s0 <= s <= s1
+                    ]
                 if not section_pts_with_s:
                     continue
 
@@ -509,13 +645,17 @@ class XodrParser:
     def _parse_plan_view(
         self,
         road: ET.Element,
-        step_size: float = 2.0,
+        eps: float = 0.1,
         elevation_profile: Optional[ElevationProfile] = None,
     ) -> List[Tuple[Point3D, float]]:
         """Parse the reference line geometries into a list of (Point3D, s) pairs.
-        
-        This samples the geometric primitives (lines, arcs, spirals, polynomials) 
-        along their length to create a discrete sequence of points.
+
+        Uses adaptive sampling per geometry type, mirroring libOpenDRIVE:
+        - Line: endpoints only (already linear).
+        - Arc: ~1-degree intervals based on curvature (0.01/|curvature|).
+        - Spiral: uniform steps of 10*eps.
+        - ParamPoly3: uniform steps of eps.
+        Elevation profile change-points are merged into every segment's sample set.
         """
         plan_view = road.find("planView")
         if plan_view is None:
@@ -528,6 +668,7 @@ class XodrParser:
             y0 = float(geom.get("y", 0))
             hdg = float(geom.get("hdg", 0))
             length = float(geom.get("length", 0))
+            s_end = s_start + length
 
             def _z(s: float) -> float:
                 return elevation_profile.get_z(s) if elevation_profile else 0.0
@@ -535,97 +676,122 @@ class XodrParser:
             # Skip duplicate start point if this isn't the first segment of the road
             skip_first = len(pts) > 0
 
+            # Build the sorted set of s-values to sample for this geometry segment.
+            # Always include both endpoints; then merge elevation change-points.
+            s_set: set = {s_start, s_end}
+            if elevation_profile:
+                s_set.update(elevation_profile.get_sample_s_values(s_start, s_end, eps))
+
             # ---------- Line Geometry ----------
             if geom.find("line") is not None:
-                num_steps = max(2, int(length / step_size))
-                for i in range(num_steps + 1):
-                    if i == 0 and skip_first:
-                        continue
-                    ds = (i / num_steps) * length
-                    s_curr = s_start + ds
-                    pts.append(
-                        (
-                            Point3D(
-                                x0 + ds * math.cos(hdg),
-                                y0 + ds * math.sin(hdg),
-                                _z(s_curr),
-                            ),
-                            s_curr,
-                        )
-                    )
+                # Lines are already linear — endpoints only (libOpenDRIVE Line::approximate_linear)
+                pass  # s_set already has s_start and s_end
 
             # ---------- Arc Geometry (Constant Curvature) ----------
             elif geom.find("arc") is not None:
-                arc = geom.find("arc")
-                curvature = float(arc.get("curvature", 0))
-                num_steps = max(2, int(length / step_size))
-                for i in range(num_steps + 1):
-                    if i == 0 and skip_first:
-                        continue
-                    ds = (i / num_steps) * length
-                    s_curr = s_start + ds
-                    if curvature == 0:
-                        x = x0 + ds * math.cos(hdg)
-                        y = y0 + ds * math.sin(hdg)
-                    else:
-                        radius = 1.0 / curvature
-                        cx = x0 - radius * math.sin(hdg)
-                        cy = y0 + radius * math.cos(hdg)
-                        theta = hdg - math.pi / 2 + ds * curvature
-                        x = cx + radius * math.cos(theta)
-                        y = cy + radius * math.sin(theta)
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr))
+                arc_elem = geom.find("arc")
+                curvature = float(arc_elem.get("curvature", 0))
+                if abs(curvature) > 1e-12:
+                    # ~1-degree steps: s_step = 0.01 / |curvature|
+                    # Mirrors libOpenDRIVE Arc::approximate_linear (TODO stub)
+                    s_step = 0.01 / abs(curvature)
+                    s = s_start
+                    while s < s_end:
+                        s_set.add(s)
+                        s += s_step
+                # else: zero curvature arc is a line — endpoints suffice
 
             # ---------- Spiral Geometry (Clothoid / Euler Spiral) ----------
             elif geom.find("spiral") is not None:
-                # Curvature varies linearly with arc length: kappa(s) = k0 + ds * (dk/ds)
-                spiral = geom.find("spiral")
-                curv_start = float(spiral.get("curvStart", 0))
-                curv_end = float(spiral.get("curvEnd", 0))
-                num_steps = max(2, int(length / step_size))
-                dcurv = (curv_end - curv_start) / length if length > 0 else 0.0
-                x, y = x0, y0
-                ds_step = length / num_steps
-                for i in range(num_steps + 1):
-                    if i == 0:
-                        if not skip_first:
-                            pts.append((Point3D(x, y, _z(s_start)), s_start))
-                        continue
-                    ds_prev = (i - 1) * ds_step
-                    # Use midpoint rule for numerical integration of the spiral
-                    ds_mid = ds_prev + ds_step / 2.0
-                    h_mid = hdg + curv_start * ds_mid + 0.5 * dcurv * ds_mid**2
-                    x += ds_step * math.cos(h_mid)
-                    y += ds_step * math.sin(h_mid)
-                    s_curr = s_start + i * ds_step
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr))
+                # Uniform steps of 10*eps.
+                # Mirrors libOpenDRIVE Spiral::approximate_linear (TODO stub)
+                s_step = 10.0 * eps
+                s = s_start
+                while s < s_end:
+                    s_set.add(s)
+                    s += s_step
 
             # ---------- Parametric Cubic Polynomial Geometry ----------
             elif geom.find("paramPoly3") is not None:
-                # Defines x(p) and y(p) as cubic polynomials of parameter p
-                pp3 = geom.find("paramPoly3")
-                aU = float(pp3.get("aU", 0))
-                bU = float(pp3.get("bU", 0))
-                cU = float(pp3.get("cU", 0))
-                dU = float(pp3.get("dU", 0))
-                aV = float(pp3.get("aV", 0))
-                bV = float(pp3.get("bV", 0))
-                cV = float(pp3.get("cV", 0))
-                dV = float(pp3.get("dV", 0))
-                p_range = pp3.get("pRange", "normalized")
-                num_steps = max(2, int(length / step_size))
-                cos_h, sin_h = math.cos(hdg), math.sin(hdg)
-                for i in range(num_steps + 1):
-                    if i == 0 and skip_first:
+                # Uniform steps of eps for fine-grained sampling
+                s_step = eps
+                s = s_start
+                while s < s_end:
+                    s_set.add(s)
+                    s += s_step
+
+            # Evaluate geometry at each sample s-value in sorted order.
+            # For arc and paramPoly3 we need the element attributes; re-fetch here.
+            arc_elem = geom.find("arc")
+            pp3_elem = geom.find("paramPoly3")
+            spiral_elem = geom.find("spiral")
+
+            if arc_elem is not None:
+                curvature = float(arc_elem.get("curvature", 0))
+            if spiral_elem is not None:
+                curv_start_sp = float(spiral_elem.get("curvStart", 0))
+                curv_end_sp = float(spiral_elem.get("curvEnd", 0))
+                dcurv = (curv_end_sp - curv_start_sp) / length if length > 0 else 0.0
+            if pp3_elem is not None:
+                aU = float(pp3_elem.get("aU", 0))
+                bU = float(pp3_elem.get("bU", 0))
+                cU = float(pp3_elem.get("cU", 0))
+                dU = float(pp3_elem.get("dU", 0))
+                aV = float(pp3_elem.get("aV", 0))
+                bV = float(pp3_elem.get("bV", 0))
+                cV = float(pp3_elem.get("cV", 0))
+                dV = float(pp3_elem.get("dV", 0))
+                p_range = pp3_elem.get("pRange", "normalized")
+                cos_h = math.cos(hdg)
+                sin_h = math.sin(hdg)
+
+            # For spiral: integrate heading incrementally — must iterate in order
+            if spiral_elem is not None:
+                sorted_s = sorted(s_set)
+                x, y = x0, y0
+                prev_s = s_start
+                for s_curr in sorted_s:
+                    if s_curr == s_start:
+                        if not skip_first:
+                            pts.append((Point3D(x, y, _z(s_start)), s_start))
                         continue
-                    t = i / num_steps
-                    p = t * length if p_range == "arcLength" else t
-                    u = aU + bU * p + cU * p**2 + dU * p**3
-                    v = aV + bV * p + cV * p**2 + dV * p**3
-                    # Rotate local (u, v) coordinates by segment heading
-                    x = x0 + u * cos_h - v * sin_h
-                    y = y0 + u * sin_h + v * cos_h
-                    s_curr = s_start + t * length
+                    ds_step = s_curr - prev_s
+                    ds_mid = (prev_s - s_start) + ds_step / 2.0
+                    h_mid = hdg + curv_start_sp * ds_mid + 0.5 * dcurv * ds_mid**2
+                    x += ds_step * math.cos(h_mid)
+                    y += ds_step * math.sin(h_mid)
+                    pts.append((Point3D(x, y, _z(s_curr)), s_curr))
+                    prev_s = s_curr
+            else:
+                for s_curr in sorted(s_set):
+                    if s_curr == s_start and skip_first:
+                        continue
+                    ds = s_curr - s_start
+
+                    if geom.find("line") is not None:
+                        x = x0 + ds * math.cos(hdg)
+                        y = y0 + ds * math.sin(hdg)
+                    elif arc_elem is not None:
+                        if abs(curvature) < 1e-12:
+                            x = x0 + ds * math.cos(hdg)
+                            y = y0 + ds * math.sin(hdg)
+                        else:
+                            radius = 1.0 / curvature
+                            cx = x0 - radius * math.sin(hdg)
+                            cy = y0 + radius * math.cos(hdg)
+                            theta = hdg - math.pi / 2 + ds * curvature
+                            x = cx + radius * math.cos(theta)
+                            y = cy + radius * math.sin(theta)
+                    elif pp3_elem is not None:
+                        t = ds / length if length > 0 else 0.0
+                        p = ds if p_range == "arcLength" else t
+                        u = aU + bU * p + cU * p**2 + dU * p**3
+                        v = aV + bV * p + cV * p**2 + dV * p**3
+                        x = x0 + u * cos_h - v * sin_h
+                        y = y0 + u * sin_h + v * cos_h
+                    else:
+                        continue
+
                     pts.append((Point3D(x, y, _z(s_curr)), s_curr))
 
         return pts

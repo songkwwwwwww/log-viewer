@@ -181,8 +181,11 @@ class LogViewer:
                 # (OpenDRIVE spec). Flip the computed tangent for those lanes.
                 dir_sign = -1.0 if lane.is_left else 1.0
 
-                # Place direction arrows at start, midpoint, and end of the center line
-                arrow_indices = [0, len(cps) // 2, len(cps) - 2]
+                # Place direction arrows at start, midpoint, and end of the center
+                # line. Each idx must satisfy idx+1 < len(cps) to compute a tangent.
+                last = len(cps) - 2  # last valid tangent index
+                mid = min(len(cps) // 2, last)
+                arrow_indices = sorted(set([0, mid, last]))
                 origins = []
                 vectors = []
                 arrow_scale = 2.0  # length in world units
@@ -225,7 +228,7 @@ class LogViewer:
             frame: The scene frame containing all object states at a given timestamp.
         """
         # Set the current simulation time in Rerun
-        rr.set_time_seconds("sim_time", frame.timestamp)
+        rr.set_time("sim_time", timestamp=frame.timestamp)
 
         for obj_id, obj in frame.objects.items():
             obj_path = f"objects/{obj_id}"
@@ -271,13 +274,13 @@ class LogViewer:
 
             # ---- Scalar timeseries per object ----
             # These are plotted in the TimeSeriesViews defined in the blueprint
-            rr.log(f"{obj_path}/scalars/speed", rr.Scalar(speed))
-            rr.log(f"{obj_path}/scalars/acceleration", rr.Scalar(accel))
-            rr.log(f"{obj_path}/scalars/position_x", rr.Scalar(obj.position.x))
-            rr.log(f"{obj_path}/scalars/position_y", rr.Scalar(obj.position.y))
-            rr.log(f"{obj_path}/scalars/position_z", rr.Scalar(obj.position.z))
-            rr.log(f"{obj_path}/scalars/velocity_x", rr.Scalar(obj.velocity.x))
-            rr.log(f"{obj_path}/scalars/velocity_y", rr.Scalar(obj.velocity.y))
+            rr.log(f"{obj_path}/scalars/speed", rr.Scalars(speed))
+            rr.log(f"{obj_path}/scalars/acceleration", rr.Scalars(accel))
+            rr.log(f"{obj_path}/scalars/position_x", rr.Scalars(obj.position.x))
+            rr.log(f"{obj_path}/scalars/position_y", rr.Scalars(obj.position.y))
+            rr.log(f"{obj_path}/scalars/position_z", rr.Scalars(obj.position.z))
+            rr.log(f"{obj_path}/scalars/velocity_x", rr.Scalars(obj.velocity.x))
+            rr.log(f"{obj_path}/scalars/velocity_y", rr.Scalars(obj.velocity.y))
 
             # ---- Future trajectory ----
             # Draws a line representing the predicted future path of the object
