@@ -24,10 +24,20 @@ _LANE_COLORS = {
     "shoulder": [100, 95, 90, 255],
 }
 
-# Object type colors [R, G, B]
+# Object type colors [R, G, B] — fallback when sub_type is not recognized.
 _OBJECT_COLORS = {
     "vehicle": [0, 100, 255],
     "pedestrian": [255, 100, 0],
+}
+
+# Sub-type color overrides [R, G, B].
+# When an object has a recognized sub_type, this palette takes priority over
+# the type-based color above.
+_SUB_TYPE_COLORS = {
+    "yellow": [255, 200, 0],
+    "blue": [0, 100, 255],
+    "red": [220, 50, 50],
+    "unknown": [160, 160, 160],
 }
 
 
@@ -240,8 +250,11 @@ class LogViewer:
             )
 
             # ---- Per-object 3D bounding box + Selection metadata ----
-            # Bounding boxes represent the physical extent of the object
-            color = _OBJECT_COLORS.get(obj.type, [200, 200, 200])
+            # Bounding boxes represent the physical extent of the object.
+            # sub_type color takes priority; fall back to type-based color.
+            color = _SUB_TYPE_COLORS.get(
+                obj.sub_type, _OBJECT_COLORS.get(obj.type, [200, 200, 200])
+            )
             rr.log(
                 f"{obj_path}/box",
                 rr.Boxes3D(
@@ -262,6 +275,8 @@ class LogViewer:
                 rr.AnyValues(
                     object_id=obj.id,
                     object_type=obj.type,
+                    object_sub_type=obj.sub_type,
+                    is_static=obj.is_static,
                     position_x=obj.position.x,
                     position_y=obj.position.y,
                     position_z=obj.position.z,

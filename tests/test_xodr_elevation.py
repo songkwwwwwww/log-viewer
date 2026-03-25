@@ -43,5 +43,15 @@ def test_elevation_profile_cubic():
     assert profile.get_z(3.0) == 27.0  # 3^3
 
 
+def test_elevation_profile_defaults_to_zero_before_first_entry():
+    """Verify that the profile stays at zero before the first explicit record."""
+    profile = ElevationProfile(
+        [ElevationEntry(s=10.0, a=5.0, b=1.0, c=0.0, d=0.0)]
+    )
+    assert profile.get_z(0.0) == 0.0
+    assert profile.get_z(5.0) == 0.0
+    assert profile.get_z(10.0) == 5.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

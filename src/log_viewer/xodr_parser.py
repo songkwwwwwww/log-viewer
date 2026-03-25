@@ -16,8 +16,9 @@ Key OpenDRIVE concepts handled:
 
 import xml.etree.ElementTree as ET
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from scipy.special import fresnel as _scipy_fresnel
 
@@ -199,6 +200,355 @@ def _cross_product(
     )
 
 
+def _cubic_bezier_1d_get_control_points(
+    a: float, b: float, c: float, d: float
+) -> Tuple[float, float, float, float]:
+    """Return Bézier control points for a cubic polynomial a + b*p + c*p^2 + d*p^3."""
+    p0 = a
+    p1 = b / 3.0 + a
+    p2 = c / 3.0 + 2.0 * p1 - p0
+    p3 = d + 3.0 * p2 - 3.0 * p1 + p0
+    return p0, p1, p2, p3
+
+
+def _cubic_bezier_1d_get_coefficients(
+    ctrl_pts: Tuple[float, float, float, float]
+) -> Tuple[float, float, float, float]:
+    """Return polynomial coefficients for a cubic Bézier curve."""
+    p_a, p_b, p_c, p_d = ctrl_pts
+    return (
+        p_a,
+        3.0 * p_b - 3.0 * p_a,
+        3.0 * p_c - 6.0 * p_b + 3.0 * p_a,
+        p_d - 3.0 * p_c + 3.0 * p_b - p_a,
+    )
+
+
+def _approximate_linear_quad_bezier_1d(
+    ctrl_pts: Tuple[float, float, float], eps: float
+) -> List[float]:
+    """Approximate a quadratic Bézier curve by linear segments."""
+    param_c = ctrl_pts[0] - 2.0 * ctrl_pts[1] + ctrl_pts[2]
+    if abs(param_c) <= 1e-12:
+        step_size = 1.0
+    else:
+        step_size = min(math.sqrt((4.0 * eps) / abs(param_c)), 1.0)
+
+    p_vals = []
+    p = 0.0
+    while p < 1.0:
+        p_vals.append(p)
+        p += step_size
+    if not p_vals or p_vals[-1] != 1.0:
+        p_vals.append(1.0)
+    return p_vals
+
+
+def _cubic_bezier_1d_subcurve(
+    ctrl_pts: Tuple[float, float, float, float], t_start: float, t_end: float
+) -> Tuple[float, float, float, float]:
+    """Extract the control points of a cubic Bézier sub-curve."""
+
+    def _f_cubic_t123(t1: float, t2: float, t3: float) -> float:
+        return (
+            (1.0 - t3)
+            * (
+                (1.0 - t2)
+                * ((1.0 - t1) * ctrl_pts[0] + t1 * ctrl_pts[1])
+                + t2 * ((1.0 - t1) * ctrl_pts[1] + t1 * ctrl_pts[2])
+            )
+            + t3
+            * (
+                (1.0 - t2)
+                * ((1.0 - t1) * ctrl_pts[1] + t1 * ctrl_pts[2])
+                + t2 * ((1.0 - t1) * ctrl_pts[2] + t1 * ctrl_pts[3])
+            )
+        )
+
+    return (
+        _f_cubic_t123(t_start, t_start, t_start),
+        _f_cubic_t123(t_start, t_start, t_end),
+        _f_cubic_t123(t_start, t_end, t_end),
+        _f_cubic_t123(t_end, t_end, t_end),
+    )
+
+
+def _cubic_bezier_1d_approximate_linear(
+    ctrl_pts: Tuple[float, float, float, float], eps: float
+) -> List[float]:
+    """Approximate a cubic Bézier curve by linear segments.
+
+    Mirrors CubicBezier<double, 1>::approximate_linear() in libOpenDRIVE.
+    """
+    _, _, _, coeff_3 = _cubic_bezier_1d_get_coefficients(ctrl_pts)
+    if abs(coeff_3) <= 1e-12:
+        seg_size = 1.0
+    else:
+        seg_size = pow((0.5 * eps) / ((1.0 / 54.0) * abs(coeff_3)), 1.0 / 3.0)
+
+    seg_intervals = []
+    t = 0.0
+    while t < 1.0:
+        seg_intervals.append((t, min(t + seg_size, 1.0)))
+        t += seg_size
+    if not seg_intervals:
+        seg_intervals.append((0.0, 1.0))
+    elif (1.0 - seg_intervals[-1][1]) < 1e-6:
+        seg_intervals[-1] = (seg_intervals[-1][0], 1.0)
+    else:
+        seg_intervals.append((seg_intervals[-1][1], 1.0))
+
+    t_vals = [0.0]
+    for t0, t1 in seg_intervals:
+        sub_curve = _cubic_bezier_1d_subcurve(ctrl_pts, t0, t1)
+        p_b_quad_0 = 0.25 * sub_curve[0] + 0.75 * sub_curve[1]
+        p_b_quad_1 = 0.25 * sub_curve[3] + 0.75 * sub_curve[2]
+        p_m_quad = 0.5 * (p_b_quad_0 + p_b_quad_1)
+
+        for p_sub in _approximate_linear_quad_bezier_1d(
+            (sub_curve[0], p_b_quad_0, p_m_quad), 0.5 * eps
+        ):
+            t_vals.append(t0 + p_sub * (t1 - t0) * 0.5)
+        t_vals.pop()
+
+        for p_sub in _approximate_linear_quad_bezier_1d(
+            (p_m_quad, p_b_quad_1, sub_curve[3]), 0.5 * eps
+        ):
+            t_vals.append(t0 + (t1 - t0) * 0.5 + p_sub * (t1 - t0) * 0.5)
+        t_vals.pop()
+
+    t_vals.append(1.0)
+    return sorted(set(t_vals))
+
+
+@dataclass
+class _CubicPoly:
+    """Absolute-s cubic polynomial representation used by libOpenDRIVE."""
+
+    a: float
+    b: float
+    c: float
+    d: float
+
+    @classmethod
+    def from_relative(
+        cls, s_origin: float, a: float, b: float, c: float, d: float
+    ) -> "_CubicPoly":
+        """Convert a ds-based polynomial into absolute-s form."""
+        return cls(
+            a=a - b * s_origin + c * s_origin * s_origin - d * s_origin**3,
+            b=b - 2.0 * c * s_origin + 3.0 * d * s_origin * s_origin,
+            c=c - 3.0 * d * s_origin,
+            d=d,
+        )
+
+    def evaluate(self, s: float) -> float:
+        return self.a + self.b * s + self.c * s * s + self.d * s * s * s
+
+    def derivative(self, s: float) -> float:
+        return self.b + 2.0 * self.c * s + 3.0 * self.d * s * s
+
+    def negate(self) -> "_CubicPoly":
+        return _CubicPoly(-self.a, -self.b, -self.c, -self.d)
+
+    def max_value(self, s_start: float, s_end: float) -> float:
+        if self.d != 0.0:
+            disc = self.c * self.c - 3.0 * self.b * self.d
+            if disc < 0.0:
+                return max(self.evaluate(s_start), self.evaluate(s_end))
+            s_extr = (math.sqrt(disc) - self.c) / (3.0 * self.d)
+            max_val_1 = self.evaluate(min(max(s_extr, s_start), s_end))
+            max_val_2 = self.evaluate(min(max(-s_extr, s_start), s_end))
+            return max(max_val_1, max_val_2)
+        if self.c != 0.0:
+            s_extr = (-self.b) / (2.0 * self.c)
+            return self.evaluate(min(max(s_extr, s_start), s_end))
+        return max(self.evaluate(s_start), self.evaluate(s_end))
+
+    def get_sample_s_values(
+        self, eps: float, s_start: float, s_end: float
+    ) -> List[float]:
+        """Return the s-values needed to linearly approximate this polynomial."""
+        if s_start == s_end:
+            return []
+        if self.d == 0.0 and self.c == 0.0:
+            return [s_start, s_end]
+        if self.d == 0.0 and self.c != 0.0:
+            step = 2.0 * math.sqrt(abs(eps / self.c))
+            s_vals = []
+            s = s_start
+            while s < s_end:
+                s_vals.append(s)
+                s += step
+        else:
+            s_0 = s_start
+            s_1 = s_end
+            d_p = (
+                -self.d * s_0**3
+                + self.d * s_1**3
+                - 3.0 * self.d * s_0 * s_1 * s_1
+                + 3.0 * self.d * s_0 * s_0 * s_1
+            )
+            c_p = (
+                3.0 * self.d * s_0**3
+                + 3.0 * self.d * s_0 * s_1 * s_1
+                - 6.0 * self.d * s_0 * s_0 * s_1
+                + self.c * s_0 * s_0
+                + self.c * s_1 * s_1
+                - 2.0 * self.c * s_0 * s_1
+            )
+            b_p = (
+                -3.0 * self.d * s_0**3
+                + 3.0 * self.d * s_0 * s_0 * s_1
+                - 2.0 * self.c * s_0 * s_0
+                + 2.0 * self.c * s_0 * s_1
+                - self.b * s_0
+                + self.b * s_1
+            )
+            a_p = self.d * s_0**3 + self.c * s_0 * s_0 + self.b * s_0 + self.a
+            ctrl_pts = _cubic_bezier_1d_get_control_points(a_p, b_p, c_p, d_p)
+            p_vals = _cubic_bezier_1d_approximate_linear(ctrl_pts, eps)
+            s_vals = [s_start]
+            for p in p_vals:
+                s_vals.append(p * (s_end - s_start) + s_start)
+
+        if (s_end - s_vals[-1]) < 1e-9 and len(s_vals) != 1:
+            s_vals[-1] = s_end
+        else:
+            s_vals.append(s_end)
+
+        return sorted(set(s_vals))
+
+
+class _CubicProfile:
+    """Piecewise absolute-s cubic profile mirroring libOpenDRIVE CubicProfile."""
+
+    def __init__(self, segments: Optional[Dict[float, _CubicPoly]] = None):
+        self.segments = dict(sorted((segments or {}).items()))
+
+    def _keys(self) -> List[float]:
+        return list(self.segments.keys())
+
+    def get_poly(self, s: float, extend_start: bool = True) -> Optional[_CubicPoly]:
+        if not self.segments:
+            return None
+
+        keys = self._keys()
+        if not extend_start and s < keys[0]:
+            return None
+
+        idx = bisect_right(keys, s) - 1
+        if idx < 0:
+            idx = 0
+        return self.segments[keys[idx]]
+
+    def evaluate(
+        self, s: float, default_val: float = 0.0, extend_start: bool = True
+    ) -> float:
+        poly = self.get_poly(s, extend_start=extend_start)
+        if poly is None:
+            return default_val
+        return poly.evaluate(s)
+
+    def derivative(
+        self, s: float, default_val: float = 0.0, extend_start: bool = True
+    ) -> float:
+        poly = self.get_poly(s, extend_start=extend_start)
+        if poly is None:
+            return default_val
+        return poly.derivative(s)
+
+    def negate(self) -> "_CubicProfile":
+        return _CubicProfile(
+            {s0: poly.negate() for s0, poly in self.segments.items()}
+        )
+
+    def add(self, other: "_CubicProfile") -> "_CubicProfile":
+        if not other.segments:
+            return _CubicProfile(dict(self.segments))
+        if not self.segments:
+            return _CubicProfile(dict(other.segments))
+
+        s0_vals = sorted(set(self.segments).union(other.segments))
+        segments: Dict[float, _CubicPoly] = {}
+        for s0 in s0_vals:
+            this_poly = self.get_poly(s0, extend_start=False)
+            other_poly = other.get_poly(s0, extend_start=False)
+            if this_poly is None:
+                segments[s0] = other_poly
+            elif other_poly is None:
+                segments[s0] = this_poly
+            else:
+                segments[s0] = _CubicPoly(
+                    this_poly.a + other_poly.a,
+                    this_poly.b + other_poly.b,
+                    this_poly.c + other_poly.c,
+                    this_poly.d + other_poly.d,
+                )
+        return _CubicProfile(segments)
+
+    def max_value(self, s_start: float, s_end: float) -> float:
+        if s_start == s_end or not self.segments:
+            return 0.0
+
+        keys = self._keys()
+        end_idx = bisect_left(keys, s_end)
+        start_idx = bisect_right(keys, s_start) - 1
+        if start_idx < 0:
+            start_idx = 0
+
+        max_vals = []
+        for idx in range(start_idx, end_idx):
+            s0 = keys[idx]
+            poly = self.segments[s0]
+            s_start_poly = max(s0, s_start)
+            next_s0 = keys[idx + 1] if idx + 1 < end_idx else None
+            s_end_poly = s_end if next_s0 is None else min(next_s0, s_end)
+            max_vals.append(poly.max_value(s_start_poly, s_end_poly))
+        return max(max_vals, default=0.0)
+
+    def get_sample_s_values(
+        self, eps: float, s_start: float, s_end: float
+    ) -> List[float]:
+        if s_start == s_end or not self.segments:
+            return []
+
+        keys = self._keys()
+        end_idx = bisect_left(keys, s_end)
+        start_idx = bisect_right(keys, s_start) - 1
+        if start_idx < 0:
+            start_idx = 0
+
+        s_vals: set = set()
+        for idx in range(start_idx, end_idx):
+            s0 = keys[idx]
+            poly = self.segments[s0]
+            s_start_poly = max(s0, s_start)
+            next_s0 = keys[idx + 1] if idx + 1 < end_idx else None
+            s_end_poly = s_end if next_s0 is None else min(next_s0, s_end)
+            s_vals.update(poly.get_sample_s_values(eps, s_start_poly, s_end_poly))
+        return sorted(s_vals)
+
+
+def _zero_cubic_profile() -> _CubicProfile:
+    """Return a constant-zero profile defined over the whole road."""
+    return _CubicProfile({0.0: _CubicPoly.from_relative(0.0, 0.0, 0.0, 0.0, 0.0)})
+
+
+def _thin_s_values(s_values: List[float], eps: float) -> List[float]:
+    """Remove redundant sample points closer than eps, mirroring libOpenDRIVE."""
+    result = list(s_values)
+    idx = 0
+    while idx + 2 < len(result):
+        if (result[idx + 1] - result[idx]) <= eps:
+            result.pop(idx + 1)
+            if idx > 0:
+                idx -= 1
+        else:
+            idx += 1
+    return result
+
+
 
 def _compute_e_t(
     e_s: Tuple[float, float, float], theta: float
@@ -229,53 +579,6 @@ class ElevationEntry:
     c: float
     d: float
 
-
-def _cubic_poly_sample_s_values(
-    s_entry: float,
-    s_entry_end: float,
-    c: float,
-    d: float,
-    s_start: float,
-    s_end: float,
-    eps: float,
-) -> List[float]:
-    """Compute s-values needing explicit samples within a cubic polynomial segment.
-
-    Mirrors libOpenDRIVE CubicPoly::approximate_linear logic:
-    - Linear (c==0, d==0): only endpoints needed.
-    - Quadratic (d==0, c!=0): uniform steps of 2*sqrt(|eps/c|).
-    - Cubic: subdivide segment into ~10 uniform steps as a practical approximation.
-
-    Returns s-values clipped to [s_start, s_end].
-    """
-    seg_s_start = max(s_entry, s_start)
-    seg_s_end = min(s_entry_end, s_end)
-    if seg_s_end <= seg_s_start:
-        return []
-
-    result = [seg_s_start, seg_s_end]
-
-    if d == 0.0 and c == 0.0:
-        pass  # linear — endpoints suffice
-    elif d == 0.0 and c != 0.0:
-        # quadratic: step derived from curvature tolerance
-        step = 2.0 * math.sqrt(abs(eps / c)) if abs(c) > 1e-12 else (seg_s_end - seg_s_start)
-        s = seg_s_start + step
-        while s < seg_s_end:
-            result.append(s)
-            s += step
-    else:
-        # cubic: ~10 uniform subdivisions as a practical approximation
-        n = max(2, int((seg_s_end - seg_s_start) / (10.0 * eps)))
-        step = (seg_s_end - seg_s_start) / n
-        s = seg_s_start + step
-        while s < seg_s_end:
-            result.append(s)
-            s += step
-
-    return result
-
-
 class ElevationProfile:
     """Manages multiple elevation entries and evaluates Z at any s position.
 
@@ -285,29 +588,20 @@ class ElevationProfile:
 
     def __init__(self, entries: List[ElevationEntry]):
         """Initialize with a list of elevation entries, sorted by s."""
-        self.entries = sorted(entries, key=lambda e: e.s)
+        segments = {0.0: _CubicPoly.from_relative(0.0, 0.0, 0.0, 0.0, 0.0)}
+        for entry in sorted(entries, key=lambda e: e.s):
+            segments[entry.s] = _CubicPoly.from_relative(
+                entry.s, entry.a, entry.b, entry.c, entry.d
+            )
+        self._profile = _CubicProfile(segments)
 
     def get_z(self, s: float) -> float:
         """Calculate the elevation Z at distance s along the road."""
-        if not self.entries:
-            return 0.0
+        return self._profile.evaluate(s)
 
-        # Find the "active" polynomial entry for the given s
-        active_entry = self.entries[0]
-        for entry in self.entries:
-            if s >= entry.s:
-                active_entry = entry
-            else:
-                break
-
-        ds = s - active_entry.s
-        # z(ds) = a + b*ds + c*ds^2 + d*ds^3
-        return (
-            active_entry.a
-            + active_entry.b * ds
-            + active_entry.c * ds**2
-            + active_entry.d * ds**3
-        )
+    def get_dz(self, s: float) -> float:
+        """Return dz/ds at position s."""
+        return self._profile.derivative(s)
 
     def get_sample_s_values(
         self, s_start: float, s_end: float, eps: float
@@ -316,16 +610,7 @@ class ElevationProfile:
 
         Mirrors libOpenDRIVE CubicProfile::approximate_linear.
         """
-        s_set: set = set()
-        s_set.add(s_start)
-        s_set.add(s_end)
-        entries = self.entries
-        for i, entry in enumerate(entries):
-            next_s = entries[i + 1].s if i + 1 < len(entries) else math.inf
-            s_set.update(
-                _cubic_poly_sample_s_values(entry.s, next_s, entry.c, entry.d, s_start, s_end, eps)
-            )
-        return sorted(v for v in s_set if s_start <= v <= s_end)
+        return self._profile.get_sample_s_values(eps, s_start, s_end)
 
 
 @dataclass
@@ -343,42 +628,22 @@ class LaneOffsetProfile:
     """Manages lateral offset of the entire lane group from the reference line."""
 
     def __init__(self, entries: List[LaneOffsetEntry]):
-        self.entries = sorted(entries, key=lambda e: e.s)
+        segments = {0.0: _CubicPoly.from_relative(0.0, 0.0, 0.0, 0.0, 0.0)}
+        for entry in sorted(entries, key=lambda e: e.s):
+            segments[entry.s] = _CubicPoly.from_relative(
+                entry.s, entry.a, entry.b, entry.c, entry.d
+            )
+        self._profile = _CubicProfile(segments)
 
     def get_offset(self, s: float) -> float:
         """Evaluates the lateral offset at position s."""
-        if not self.entries:
-            return 0.0
-
-        active_entry = self.entries[0]
-        for entry in self.entries:
-            if s >= entry.s:
-                active_entry = entry
-            else:
-                break
-
-        ds = s - active_entry.s
-        return (
-            active_entry.a
-            + active_entry.b * ds
-            + active_entry.c * ds**2
-            + active_entry.d * ds**3
-        )
+        return self._profile.evaluate(s)
 
     def get_sample_s_values(
         self, s_start: float, s_end: float, eps: float
     ) -> List[float]:
         """Return s-values where this profile needs explicit sampling."""
-        s_set: set = set()
-        s_set.add(s_start)
-        s_set.add(s_end)
-        entries = self.entries
-        for i, entry in enumerate(entries):
-            next_s = entries[i + 1].s if i + 1 < len(entries) else math.inf
-            s_set.update(
-                _cubic_poly_sample_s_values(entry.s, next_s, entry.c, entry.d, s_start, s_end, eps)
-            )
-        return sorted(v for v in s_set if s_start <= v <= s_end)
+        return self._profile.get_sample_s_values(eps, s_start, s_end)
 
 
 @dataclass
@@ -407,35 +672,22 @@ class SuperelevationProfile:
     """Evaluates road superelevation (roll angle) at any s position."""
 
     def __init__(self, entries: List[SuperelevationEntry]):
-        self.entries = sorted(entries, key=lambda e: e.s)
+        segments = {0.0: _CubicPoly.from_relative(0.0, 0.0, 0.0, 0.0, 0.0)}
+        for entry in sorted(entries, key=lambda e: e.s):
+            segments[entry.s] = _CubicPoly.from_relative(
+                entry.s, entry.a, entry.b, entry.c, entry.d
+            )
+        self._profile = _CubicProfile(segments)
 
     def get_value(self, s: float) -> float:
         """Returns the superelevation angle in radians at position s."""
-        if not self.entries:
-            return 0.0
-        active = self.entries[0]
-        for entry in self.entries:
-            if s >= entry.s:
-                active = entry
-            else:
-                break
-        ds = s - active.s
-        return active.a + active.b * ds + active.c * ds**2 + active.d * ds**3
+        return self._profile.evaluate(s)
 
     def get_sample_s_values(
         self, s_start: float, s_end: float, eps: float
     ) -> List[float]:
         """Return s-values where this profile needs explicit sampling."""
-        s_set: set = set()
-        s_set.add(s_start)
-        s_set.add(s_end)
-        entries = self.entries
-        for i, entry in enumerate(entries):
-            next_s = entries[i + 1].s if i + 1 < len(entries) else math.inf
-            s_set.update(
-                _cubic_poly_sample_s_values(entry.s, next_s, entry.c, entry.d, s_start, s_end, eps)
-            )
-        return sorted(v for v in s_set if s_start <= v <= s_end)
+        return self._profile.get_sample_s_values(eps, s_start, s_end)
 
 
 @dataclass
@@ -548,42 +800,14 @@ class XodrParser:
 
             # Parse laneOffset profile (applies lateral shift to all lanes)
             lane_offset_profile = self._parse_lane_offset_profile(lanes)
+            lane_offset_cubic = lane_offset_profile._profile
 
-            # Collect all s-values that need explicit sampling:
-            # lane section boundaries + lane_offset/superelevation change-points
-            # + per-lane width entry boundaries.
-            # Mirrors libOpenDRIVE Road::get_lane_mesh s-value union strategy.
-            road_s_start = ref_line_with_s[0][1]   # index 1 = s value
+            # Base reference-line s-values, shared by all lanes on this road.
+            # Each lane later extends this set with inner/outer border and
+            # superelevation-specific samples, mirroring Road::get_lane_mesh().
+            road_s_start = ref_line_with_s[0][1]
             road_s_end = ref_line_with_s[-1][1]
-            extra_s: set = set()
-
-            # Lane section boundaries
-            for ls in lanes.findall("laneSection"):
-                extra_s.add(float(ls.get("s", 0.0)))
-
-            # Lane offset profile change-points
-            extra_s.update(
-                lane_offset_profile.get_sample_s_values(road_s_start, road_s_end, _SAMPLING_EPS)
-            )
-
-            # Superelevation change-points
-            extra_s.update(
-                superelevation_profile.get_sample_s_values(road_s_start, road_s_end, _SAMPLING_EPS)
-            )
-
-            # Width entry boundary s-values for every lane in every lane section
-            for ls in lanes.findall("laneSection"):
-                ls_s0 = float(ls.get("s", 0.0))
-                for side in (ls.find("left"), ls.find("right")):
-                    if side is None:
-                        continue
-                    for lane_tag in side.findall("lane"):
-                        for wt in lane_tag.findall("width"):
-                            extra_s.add(ls_s0 + float(wt.get("sOffset", 0.0)))
-
-            ref_line_with_s = _insert_boundary_points(
-                ref_line_with_s, sorted(extra_s)
-            )
+            road_sample_s_values = [s for _, s, _ in ref_line_with_s]
 
             # Process all lane sections within the road
             lane_sections = lanes.findall("laneSection")
@@ -592,36 +816,12 @@ class XodrParser:
 
             for idx, lane_section in enumerate(lane_sections):
                 s0 = float(lane_section.get("s", 0.0))
-                is_last_section = idx + 1 >= len(lane_sections)
                 s1 = (
-                    float(lane_sections[idx + 1].get("s", math.inf))
-                    if not is_last_section
-                    else math.inf
+                    float(lane_sections[idx + 1].get("s", road_s_end))
+                    if idx + 1 < len(lane_sections)
+                    else road_s_end
                 )
-
-                # Slice reference line points for this section.
-                # Include [s0, s1] so the section has a proper end vertex at the
-                # boundary. The boundary point at s == s1 is evaluated using this
-                # section's width polynomial (section_s0-relative), which is
-                # correct because width polynomials are defined up to the next
-                # section boundary. The last section uses s0 <= s.
-                if is_last_section:
-                    section_pts_with_s = [
-                        (pt, s, dxy) for pt, s, dxy in ref_line_with_s if s >= s0
-                    ]
-                else:
-                    section_pts_with_s = [
-                        (pt, s, dxy) for pt, s, dxy in ref_line_with_s if s0 <= s <= s1
-                    ]
-                if not section_pts_with_s:
-                    continue
-
-                ref_pts = [pt for pt, _, _ in section_pts_with_s]
-                s_vals = [s for _, s, _ in section_pts_with_s]
-                tangents = [dxy for _, _, dxy in section_pts_with_s]
-
-                # Compute lane offset at each sampled s point
-                lane_offsets = [lane_offset_profile.get_offset(s) for s in s_vals]
+                zero_profile = _zero_cubic_profile()
 
                 # Process left lanes (OpenDRIVE IDs are positive, build outward from center)
                 left = lane_section.find("left")
@@ -630,13 +830,39 @@ class XodrParser:
                         left.findall("lane"),
                         key=lambda t: int(t.get("id", 0)),
                     )
-                    # Left lanes build in the +normal direction; start from lane_offset
-                    inner_offsets = list(lane_offsets)
+                    prev_outer_no_offset: Optional[_CubicProfile] = None
                     for lane_tag in left_lanes:
-                        widths = self._get_lane_widths_at_s(lane_tag, s_vals, s0)
-                        outer_offsets = [
-                            inner_offsets[i] + widths[i] for i in range(len(ref_pts))
-                        ]
+                        lane_width = self._build_lane_width_profile(lane_tag, s0)
+                        inner_no_offset = (
+                            zero_profile if prev_outer_no_offset is None else prev_outer_no_offset
+                        )
+                        outer_no_offset = (
+                            lane_width
+                            if prev_outer_no_offset is None
+                            else prev_outer_no_offset.add(lane_width)
+                        )
+                        inner_border = inner_no_offset.add(lane_offset_cubic)
+                        outer_border = outer_no_offset.add(lane_offset_cubic)
+                        s_vals = self._collect_lane_sample_s_values(
+                            road_sample_s_values,
+                            s0,
+                            s1,
+                            inner_border,
+                            outer_border,
+                            superelevation_profile,
+                        )
+                        section_pts_with_s = self._parse_plan_view(
+                            road,
+                            elevation_profile=elevation_profile,
+                            sample_s_values=s_vals,
+                        )
+                        if not section_pts_with_s:
+                            prev_outer_no_offset = outer_no_offset
+                            continue
+                        ref_pts = [pt for pt, _, _ in section_pts_with_s]
+                        tangents = [dxy for _, _, dxy in section_pts_with_s]
+                        inner_offsets = [inner_border.evaluate(s) for s in s_vals]
+                        outer_offsets = [outer_border.evaluate(s) for s in s_vals]
                         parsed_lane = self._process_lane(
                             lane_tag,
                             road_id,
@@ -646,12 +872,13 @@ class XodrParser:
                             s_vals,
                             tangents,
                             is_left=True,
+                            elevation_profile=elevation_profile,
                             superelevation_profile=superelevation_profile,
                             crossfall_profile=crossfall_profile,
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
-                        inner_offsets = outer_offsets
+                        prev_outer_no_offset = outer_no_offset
 
                 # Process right lanes (OpenDRIVE IDs are negative, build outward)
                 right = lane_section.find("right")
@@ -660,14 +887,39 @@ class XodrParser:
                         right.findall("lane"),
                         key=lambda t: abs(int(t.get("id", 0))),
                     )
-                    # Right lanes build in the -normal direction; negate lane_offset
-                    # so that sign * inner_offsets = +lane_offset physically
-                    inner_offsets = [-lo for lo in lane_offsets]
+                    prev_outer_no_offset = None
                     for lane_tag in right_lanes:
-                        widths = self._get_lane_widths_at_s(lane_tag, s_vals, s0)
-                        outer_offsets = [
-                            inner_offsets[i] - widths[i] for i in range(len(ref_pts))
-                        ]
+                        lane_width = self._build_lane_width_profile(lane_tag, s0).negate()
+                        inner_no_offset = (
+                            zero_profile if prev_outer_no_offset is None else prev_outer_no_offset
+                        )
+                        outer_no_offset = (
+                            lane_width
+                            if prev_outer_no_offset is None
+                            else prev_outer_no_offset.add(lane_width)
+                        )
+                        inner_border = inner_no_offset.add(lane_offset_cubic)
+                        outer_border = outer_no_offset.add(lane_offset_cubic)
+                        s_vals = self._collect_lane_sample_s_values(
+                            road_sample_s_values,
+                            s0,
+                            s1,
+                            inner_border,
+                            outer_border,
+                            superelevation_profile,
+                        )
+                        section_pts_with_s = self._parse_plan_view(
+                            road,
+                            elevation_profile=elevation_profile,
+                            sample_s_values=s_vals,
+                        )
+                        if not section_pts_with_s:
+                            prev_outer_no_offset = outer_no_offset
+                            continue
+                        ref_pts = [pt for pt, _, _ in section_pts_with_s]
+                        tangents = [dxy for _, _, dxy in section_pts_with_s]
+                        inner_offsets = [inner_border.evaluate(s) for s in s_vals]
+                        outer_offsets = [outer_border.evaluate(s) for s in s_vals]
                         parsed_lane = self._process_lane(
                             lane_tag,
                             road_id,
@@ -677,12 +929,13 @@ class XodrParser:
                             s_vals,
                             tangents,
                             is_left=False,
+                            elevation_profile=elevation_profile,
                             superelevation_profile=superelevation_profile,
                             crossfall_profile=crossfall_profile,
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
-                        inner_offsets = outer_offsets
+                        prev_outer_no_offset = outer_no_offset
 
         return XodrMapData(lanes=lanes_to_render, road_links=road_links)
 
@@ -701,17 +954,18 @@ class XodrParser:
             )
         return LaneOffsetProfile(entries)
 
-    def _get_lane_widths_at_s(
-        self, lane_tag: ET.Element, s_vals: List[float], section_s0: float
-    ) -> List[float]:
-        """Return lane width at each s position, evaluating the cubic polynomial width profile."""
+    def _build_lane_width_profile(
+        self, lane_tag: ET.Element, section_s0: float
+    ) -> _CubicProfile:
+        """Parse lane width records into a cubic profile on absolute s."""
         width_tags = lane_tag.findall("width")
         if not width_tags:
-            # Default to 3m if no width records are present
-            return [3.0] * len(s_vals)
+            return _CubicProfile(
+                {section_s0: _CubicPoly.from_relative(section_s0, 3.0, 0.0, 0.0, 0.0)}
+            )
 
         entries = sorted(
-            [
+            (
                 WidthEntry(
                     s_offset=float(wt.get("sOffset", 0.0)),
                     a=float(wt.get("a", 3.0)),
@@ -720,23 +974,47 @@ class XodrParser:
                     d=float(wt.get("d", 0.0)),
                 )
                 for wt in width_tags
-            ],
-            key=lambda e: e.s_offset,
+            ),
+            key=lambda entry: entry.s_offset,
         )
+        segments: Dict[float, _CubicPoly] = {}
+        for entry in entries:
+            s_abs = section_s0 + entry.s_offset
+            segments[s_abs] = _CubicPoly.from_relative(
+                s_abs, entry.a, entry.b, entry.c, entry.d
+            )
+        return _CubicProfile(segments)
 
-        widths = []
-        for s in s_vals:
-            ds_from_section = s - section_s0
-            active = entries[0]
-            for entry in entries:
-                if ds_from_section >= entry.s_offset:
-                    active = entry
-                else:
-                    break
-            ds = ds_from_section - active.s_offset
-            w = active.a + active.b * ds + active.c * ds**2 + active.d * ds**3
-            widths.append(max(0.0, w))
-        return widths
+    def _collect_lane_sample_s_values(
+        self,
+        road_sample_s_values: List[float],
+        s_start: float,
+        s_end: float,
+        inner_border: _CubicProfile,
+        outer_border: _CubicProfile,
+        superelevation_profile: SuperelevationProfile,
+    ) -> List[float]:
+        """Collect lane-specific sample s-values, mirroring Road::get_lane_mesh()."""
+        s_vals = {
+            s for s in road_sample_s_values if s_start <= s <= s_end
+        }
+        s_vals.update(inner_border.get_sample_s_values(_SAMPLING_EPS, s_start, s_end))
+        s_vals.update(outer_border.get_sample_s_values(_SAMPLING_EPS, s_start, s_end))
+
+        t_max = outer_border.max_value(s_start, s_end)
+        superelev_eps = (
+            math.atan(_SAMPLING_EPS / abs(t_max))
+            if abs(t_max) > 1e-12
+            else _SAMPLING_EPS
+        )
+        s_vals.update(
+            superelevation_profile.get_sample_s_values(
+                s_start, s_end, superelev_eps
+            )
+        )
+        s_vals.add(s_start)
+        s_vals.add(s_end)
+        return _thin_s_values(sorted(s_vals), _SAMPLING_EPS)
 
     def _parse_elevation_profile(self, road: ET.Element) -> ElevationProfile:
         """Parse the elevationProfile for a road."""
@@ -773,17 +1051,18 @@ class XodrParser:
                         d=float(se.get("d", 0)),
                     )
                 )
-            for cf in lateral_tag.findall("crossFall"):
-                crossfall_entries.append(
-                    CrossfallEntry(
-                        s=float(cf.get("s", 0)),
-                        a=float(cf.get("a", 0)),
-                        b=float(cf.get("b", 0)),
-                        c=float(cf.get("c", 0)),
-                        d=float(cf.get("d", 0)),
-                        side=cf.get("side", "both"),
+            for crossfall_tag_name in ("crossfall", "crossFall"):
+                for cf in lateral_tag.findall(crossfall_tag_name):
+                    crossfall_entries.append(
+                        CrossfallEntry(
+                            s=float(cf.get("s", 0)),
+                            a=float(cf.get("a", 0)),
+                            b=float(cf.get("b", 0)),
+                            c=float(cf.get("c", 0)),
+                            d=float(cf.get("d", 0)),
+                            side=cf.get("side", "both"),
+                        )
                     )
-                )
         return SuperelevationProfile(superelev_entries), CrossfallProfile(crossfall_entries)
 
     def _parse_plan_view(
@@ -791,6 +1070,7 @@ class XodrParser:
         road: ET.Element,
         eps: float = 0.1,
         elevation_profile: Optional[ElevationProfile] = None,
+        sample_s_values: Optional[List[float]] = None,
     ) -> List[Tuple[Point3D, float, Tuple[float, float]]]:
         """Parse the reference line geometries into a list of (Point3D, s, (dx, dy)) triples.
 
@@ -837,48 +1117,53 @@ class XodrParser:
             skip_first = len(pts) > 0
 
             # Build the sorted set of s-values to sample for this geometry segment.
-            # Always include both endpoints; then merge elevation change-points.
-            s_set: set = {s_start, s_end}
-            if elevation_profile:
-                s_set.update(elevation_profile.get_sample_s_values(s_start, s_end, eps))
+            # When explicit sample values are provided, evaluate the geometry exactly
+            # at those positions instead of interpolating later.
+            if sample_s_values is not None:
+                s_set = {
+                    s for s in sample_s_values if s_start <= s <= s_end
+                }
+                if not s_set:
+                    continue
+            else:
+                s_set: set = {s_start, s_end}
+                if elevation_profile:
+                    s_set.update(
+                        elevation_profile.get_sample_s_values(s_start, s_end, eps)
+                    )
 
-            # ---------- Line Geometry ----------
-            if geom.find("line") is not None:
-                # Lines are already linear — endpoints only (libOpenDRIVE Line::approximate_linear)
-                pass  # s_set already has s_start and s_end
+                # ---------- Line Geometry ----------
+                if geom.find("line") is not None:
+                    # Lines are already linear — endpoints only (libOpenDRIVE Line::approximate_linear)
+                    pass  # s_set already has s_start and s_end
 
-            # ---------- Arc Geometry (Constant Curvature) ----------
-            elif geom.find("arc") is not None:
-                arc_elem = geom.find("arc")
-                curvature = float(arc_elem.get("curvature", 0))
-                if abs(curvature) > 1e-12:
-                    # ~1-degree steps: s_step = 0.01 / |curvature|
-                    # Mirrors libOpenDRIVE Arc::approximate_linear (TODO stub)
-                    s_step = 0.01 / abs(curvature)
+                # ---------- Arc Geometry (Constant Curvature) ----------
+                elif geom.find("arc") is not None:
+                    arc_elem = geom.find("arc")
+                    curvature = float(arc_elem.get("curvature", 0))
+                    if abs(curvature) > 1e-12:
+                        # ~1-degree steps: s_step = 0.01 / |curvature|
+                        s_step = 0.01 / abs(curvature)
+                        s = s_start
+                        while s < s_end:
+                            s_set.add(s)
+                            s += s_step
+
+                # ---------- Spiral Geometry (Clothoid / Euler Spiral) ----------
+                elif geom.find("spiral") is not None:
+                    s_step = 10.0 * eps
                     s = s_start
                     while s < s_end:
                         s_set.add(s)
                         s += s_step
-                # else: zero curvature arc is a line — endpoints suffice
 
-            # ---------- Spiral Geometry (Clothoid / Euler Spiral) ----------
-            elif geom.find("spiral") is not None:
-                # Uniform steps of 10*eps.
-                # Mirrors libOpenDRIVE Spiral::approximate_linear (TODO stub)
-                s_step = 10.0 * eps
-                s = s_start
-                while s < s_end:
-                    s_set.add(s)
-                    s += s_step
-
-            # ---------- Parametric Cubic Polynomial Geometry ----------
-            elif geom.find("paramPoly3") is not None:
-                # Uniform steps of eps for fine-grained sampling
-                s_step = eps
-                s = s_start
-                while s < s_end:
-                    s_set.add(s)
-                    s += s_step
+                # ---------- Parametric Cubic Polynomial Geometry ----------
+                elif geom.find("paramPoly3") is not None:
+                    s_step = eps
+                    s = s_start
+                    while s < s_end:
+                        s_set.add(s)
+                        s += s_step
 
             # Evaluate geometry at each sample s-value in sorted order.
             # For arc and paramPoly3 we need the element attributes; re-fetch here.
@@ -922,7 +1207,7 @@ class XodrParser:
             if spiral_elem is not None:
                 hdg_offset = hdg - a0_spiral_sp
                 for s_curr in sorted(s_set):
-                    if s_curr == s_start and skip_first:
+                    if skip_first and abs(s_curr - s_start) < 1e-9:
                         continue
                     if abs(c_dot_sp) <= 1e-12:
                         # Degenerate spiral: straight line tangent
@@ -951,7 +1236,7 @@ class XodrParser:
                     pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
             else:
                 for s_curr in sorted(s_set):
-                    if s_curr == s_start and skip_first:
+                    if skip_first and abs(s_curr - s_start) < 1e-9:
                         continue
                     ds = s_curr - s_start
 
@@ -995,6 +1280,7 @@ class XodrParser:
         s_vals: List[float],
         tangents: List[Tuple[float, float]],
         is_left: bool,
+        elevation_profile: Optional[ElevationProfile],
         superelevation_profile: "SuperelevationProfile",
         crossfall_profile: "CrossfallProfile",
     ) -> Optional[Lane]:
@@ -1032,17 +1318,8 @@ class XodrParser:
 
             # 1. Compute local orthonormal frame (e_s, e_t, e_h)
             # Use the analytic tangent stored alongside each reference-line point.
-            # elevation dz/ds is approximated by central difference — this is minor
-            # since dz is small compared to the xy tangent for typical roads.
             dx2d, dy2d = tangents[i]
-            n = len(ref_line)
-            dz = (ref_line[min(n - 1, i + 1)].z - ref_line[max(0, i - 1)].z) / max(
-                1e-12,
-                math.hypot(
-                    ref_line[min(n - 1, i + 1)].x - ref_line[max(0, i - 1)].x,
-                    ref_line[min(n - 1, i + 1)].y - ref_line[max(0, i - 1)].y,
-                ),
-            )
+            dz = elevation_profile.get_dz(s) if elevation_profile else 0.0
             e_s = _normalize_3d((dx2d, dy2d, dz))
             theta = superelevation_profile.get_value(s)
             e_t = _compute_e_t(e_s, theta)
@@ -1109,51 +1386,6 @@ class XodrParser:
             center_line=center_pts,
             is_left=is_left,
         )
-
-
-def _insert_boundary_points(
-    ref_line_with_s: List[Tuple[Point3D, float, Tuple[float, float]]],
-    boundary_s_values: List[float],
-) -> List[Tuple[Point3D, float, Tuple[float, float]]]:
-    """Ensures that lane section boundaries are explicitly represented in the ref line.
-
-    This prevents geometric "seams" or gaps between adjacent lane sections by
-    interpolating and inserting points at the exact s-coordinates where sections
-    start/end. The analytic tangent is linearly interpolated as well.
-    """
-    result = list(ref_line_with_s)
-    insert_offset = 0
-    for s_target in sorted(boundary_s_values):
-        j = insert_offset
-        while j < len(result) and result[j][1] < s_target:
-            j += 1
-        if j >= len(result):
-            break
-        if abs(result[j][1] - s_target) < 1e-9:
-            insert_offset = j + 1
-            continue  # point is already present
-        if j == 0:
-            continue  # target is before road start; skip
-
-        # Interpolate position and tangent between result[j-1] and result[j]
-        pt_a, s_a, dxy_a = result[j - 1]
-        pt_b, s_b, dxy_b = result[j]
-        t = (s_target - s_a) / (s_b - s_a)
-        pt_new = Point3D(
-            pt_a.x + t * (pt_b.x - pt_a.x),
-            pt_a.y + t * (pt_b.y - pt_a.y),
-            pt_a.z + t * (pt_b.z - pt_a.z),
-        )
-        # Interpolate and re-normalise tangent
-        dx_new = dxy_a[0] + t * (dxy_b[0] - dxy_a[0])
-        dy_new = dxy_a[1] + t * (dxy_b[1] - dxy_a[1])
-        n = math.hypot(dx_new, dy_new)
-        dxy_new = (dx_new / n, dy_new / n) if n > 0 else dxy_a
-        result.insert(j, (pt_new, s_target, dxy_new))
-        insert_offset = j + 1
-    return result
-
-
 def parse_xodr(file_path: str) -> XodrMapData:
     """Convenience function to parse an OpenDRIVE file into a map model."""
     parser = XodrParser(file_path)

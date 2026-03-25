@@ -11,6 +11,8 @@ Expected JSON Object Structure per frame:
         {
             "id": "car_1",
             "type": "vehicle",
+            "sub_type": "yellow",
+            "is_static": false,
             "position": {"x": 10.0, "y": 20.0, "z": 0.5},
             "velocity": {"x": 5.0, "y": 0.0, "z": 0.0},
             "acceleration": {"x": 0.1, "y": 0.0, "z": 0.0},
@@ -146,6 +148,8 @@ class LogParser:
             obj_state = ObjectState(
                 id=obj_id,
                 type=obj_data.get("type", "unknown"),
+                sub_type=obj_data.get("sub_type", "unknown"),
+                is_static=obj_data.get("is_static", False),
                 position=position,
                 velocity=velocity,
                 acceleration=acceleration,

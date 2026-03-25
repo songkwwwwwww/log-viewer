@@ -34,6 +34,9 @@ class ObjectState:
     Attributes:
         id: Unique identifier for the object.
         type: Classification of the object (e.g., "vehicle", "pedestrian").
+        sub_type: Sub-classification used for color coding (e.g., "yellow", "blue",
+            "red", "unknown").
+        is_static: Whether the object is stationary (not actively moving).
         position: 3D coordinates of the object's center in meters.
         velocity: Velocity vector in meters/second.
         acceleration: Acceleration vector in meters/second^2.
@@ -44,6 +47,8 @@ class ObjectState:
 
     id: str
     type: str
+    sub_type: str
+    is_static: bool
     position: Point3D
     velocity: Point3D
     acceleration: Point3D
