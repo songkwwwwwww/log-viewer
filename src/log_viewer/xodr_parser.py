@@ -647,6 +647,54 @@ class LaneOffsetProfile:
 
 
 @dataclass
+class LaneHeightEntry:
+    """Represents a lane height offset record."""
+
+    s: float
+    inner: float
+    outer: float
+
+
+class LaneHeightProfile:
+    """Evaluates lane height offset at any s position."""
+
+    def __init__(self, entries: List[LaneHeightEntry]):
+        self.entries = sorted(entries, key=lambda e: e.s)
+
+    def get_height_offset(self, s: float, p_t: float) -> float:
+        """Returns the interpolated height offset."""
+        if not self.entries:
+            return 0.0
+
+        idx = 0
+        for i, entry in enumerate(self.entries):
+            if s >= entry.s:
+                idx = i
+            else:
+                break
+
+        active = self.entries[idx]
+        inner_height = active.inner
+        outer_height = active.outer
+
+        h_t = p_t * (outer_height - inner_height) + inner_height
+
+        if idx + 1 < len(self.entries):
+            next_entry = self.entries[idx + 1]
+            ds = next_entry.s - active.s
+            if ds > 1e-9:
+                dh_inner = (next_entry.inner - inner_height) / ds * (s - active.s)
+                dh_outer = (next_entry.outer - outer_height) / ds * (s - active.s)
+                h_t += p_t * (dh_outer - dh_inner) + dh_inner
+
+        return h_t
+
+    def get_sample_s_values(self, s_start: float, s_end: float) -> List[float]:
+        """Return explicit s-values from lane height records."""
+        return [e.s for e in self.entries if s_start <= e.s <= s_end]
+
+
+@dataclass
 class WidthEntry:
     """Represents a single width record (cubic polynomial) within a lane section."""
 
@@ -833,6 +881,7 @@ class XodrParser:
                     prev_outer_no_offset: Optional[_CubicProfile] = None
                     for lane_tag in left_lanes:
                         lane_width = self._build_lane_width_profile(lane_tag, s0)
+                        lane_height = self._build_lane_height_profile(lane_tag, s0)
                         inner_no_offset = (
                             zero_profile if prev_outer_no_offset is None else prev_outer_no_offset
                         )
@@ -850,6 +899,7 @@ class XodrParser:
                             inner_border,
                             outer_border,
                             superelevation_profile,
+                            lane_height,
                         )
                         section_pts_with_s = self._parse_plan_view(
                             road,
@@ -875,6 +925,7 @@ class XodrParser:
                             elevation_profile=elevation_profile,
                             superelevation_profile=superelevation_profile,
                             crossfall_profile=crossfall_profile,
+                            lane_height_profile=lane_height,
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
@@ -890,6 +941,7 @@ class XodrParser:
                     prev_outer_no_offset = None
                     for lane_tag in right_lanes:
                         lane_width = self._build_lane_width_profile(lane_tag, s0).negate()
+                        lane_height = self._build_lane_height_profile(lane_tag, s0)
                         inner_no_offset = (
                             zero_profile if prev_outer_no_offset is None else prev_outer_no_offset
                         )
@@ -907,6 +959,7 @@ class XodrParser:
                             inner_border,
                             outer_border,
                             superelevation_profile,
+                            lane_height,
                         )
                         section_pts_with_s = self._parse_plan_view(
                             road,
@@ -932,6 +985,7 @@ class XodrParser:
                             elevation_profile=elevation_profile,
                             superelevation_profile=superelevation_profile,
                             crossfall_profile=crossfall_profile,
+                            lane_height_profile=lane_height,
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
@@ -953,6 +1007,22 @@ class XodrParser:
                 )
             )
         return LaneOffsetProfile(entries)
+
+    def _build_lane_height_profile(
+        self, lane_tag: ET.Element, section_s0: float
+    ) -> LaneHeightProfile:
+        """Parse lane height records into a LaneHeightProfile."""
+        entries = []
+        for ht in lane_tag.findall("height"):
+            s_offset = float(ht.get("sOffset", 0.0))
+            inner = float(ht.get("inner", 0.0))
+            outer = float(ht.get("outer", 0.0))
+            entries.append(
+                LaneHeightEntry(
+                    s=section_s0 + s_offset, inner=inner, outer=outer
+                )
+            )
+        return LaneHeightProfile(entries)
 
     def _build_lane_width_profile(
         self, lane_tag: ET.Element, section_s0: float
@@ -993,6 +1063,7 @@ class XodrParser:
         inner_border: _CubicProfile,
         outer_border: _CubicProfile,
         superelevation_profile: SuperelevationProfile,
+        lane_height_profile: "LaneHeightProfile",
     ) -> List[float]:
         """Collect lane-specific sample s-values, mirroring Road::get_lane_mesh()."""
         s_vals = {
@@ -1000,6 +1071,7 @@ class XodrParser:
         }
         s_vals.update(inner_border.get_sample_s_values(_SAMPLING_EPS, s_start, s_end))
         s_vals.update(outer_border.get_sample_s_values(_SAMPLING_EPS, s_start, s_end))
+        s_vals.update(lane_height_profile.get_sample_s_values(s_start, s_end))
 
         t_max = outer_border.max_value(s_start, s_end)
         superelev_eps = (
@@ -1283,6 +1355,7 @@ class XodrParser:
         elevation_profile: Optional[ElevationProfile],
         superelevation_profile: "SuperelevationProfile",
         crossfall_profile: "CrossfallProfile",
+        lane_height_profile: "LaneHeightProfile",
     ) -> Optional[Lane]:
         """Constructs a 3D Lane object from road geometry and lateral profiles.
 
@@ -1351,6 +1424,12 @@ class XodrParser:
                     h_t = h_inner + math.tan(theta) * (t_offset - io)
                 else:
                     h_t = -tan_cf * abs(t_offset)
+
+                # Apply lane height offset
+                if lane_height_profile.entries:
+                    p_t = (t_offset - io) / (oo - io) if oo != io else 0.0
+                    h_t += lane_height_profile.get_height_offset(s, p_t)
+
                 return Point3D(
                     px + e_t[0] * t_offset + e_h[0] * h_t,
                     py + e_t[1] * t_offset + e_h[1] * h_t,

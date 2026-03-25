@@ -132,6 +132,8 @@ def generate_simulation_frames(
             objects[v["id"]] = ObjectState(
                 id=v["id"],
                 type="vehicle",
+                sub_type="car",
+                is_static=False,
                 position=pos,
                 velocity=Point3D(
                     v["speed"] * math.cos(yaw), v["speed"] * math.sin(yaw), 0
@@ -140,7 +142,6 @@ def generate_simulation_frames(
                 orientation=heading_to_quaternion(yaw),
                 size=v["size"],
             )
-
         frames.append(SceneFrame(timestamp=timestamp, objects=objects))
 
     return frames
