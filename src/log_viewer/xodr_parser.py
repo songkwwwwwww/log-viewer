@@ -19,12 +19,165 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from scipy.special import fresnel as _scipy_fresnel
+
 from .geometry import Point3D
 from .map_model import Lane, LaneBoundary, RoadLink, XodrMapData
 
 # Linearization tolerance (metres) used for adaptive sampling — mirrors the eps
 # value passed to libOpenDRIVE's approximate_linear() calls.
 _SAMPLING_EPS = 0.1
+
+
+def _odr_spiral(
+    s: float, c_dot: float
+) -> Tuple[float, float, float]:
+    """Compute clothoid (Euler spiral) point at arc length s from the spiral origin.
+
+    Mirrors odrSpiral() in third_party/libOpenDRIVE/src/Geometries/Spiral/odrSpiral.cpp.
+    Uses scipy Fresnel integrals instead of the CEPHES polynomial approximation,
+    which gives the same result without accumulated numerical integration error.
+
+    Args:
+        s: Arc length along the spiral from the standard spiral origin (curv=0).
+        c_dot: Curvature rate [1/m²] = (curv_end - curv_start) / length.
+
+    Returns:
+        (x, y, t): Position in the spiral's local frame and tangent angle [rad].
+    """
+    a = math.sqrt(math.pi / abs(c_dot))
+    # scipy.special.fresnel returns (S, C) for input s/a
+    S, C = _scipy_fresnel(s / a)
+    x = C * a
+    y = S * a
+    if c_dot < 0.0:
+        y = -y
+    t = s * s * c_dot * 0.5
+    return x, y, t
+
+
+class _ParamPoly3:
+    """Evaluates a ParamPoly3 geometry at any arc-length s.
+
+    Mirrors ParamPoly3 in libOpenDRIVE/src/Geometries/ParamPoly3.cpp.
+
+    When pRange="arcLength" the XML coefficients are defined with p=s (metres),
+    so they must be rescaled to the p∈[0,1] domain before Bézier conversion.
+    After conversion, an arc-length LUT maps each s-value to the correct Bézier
+    parameter t, matching libOpenDRIVE's CubicBezier2D::get_t() behaviour.
+    """
+
+    # Number of LUT samples used to build the arc-length table.
+    _LUT_STEPS = 200
+
+    def __init__(
+        self,
+        aU: float, bU: float, cU: float, dU: float,
+        aV: float, bV: float, cV: float, dV: float,
+        length: float,
+        p_range: str,
+    ) -> None:
+        """Build the arc-length LUT for this geometry segment.
+
+        Args:
+            aU..dV: Polynomial coefficients from the XML.
+            length: Geometry segment length [m].
+            p_range: "normalized" (p∈[0,1]) or "arcLength" (p=s in metres).
+        """
+        # When pRange="arcLength" the coefficients encode p in metres.
+        # Rescale to p∈[0,1] so the polynomial and Bézier logic is uniform.
+        # Mirrors the constructor rescaling in libOpenDRIVE ParamPoly3.cpp.
+        if p_range == "arcLength" and length > 0:
+            bU *= length;  cU *= length ** 2;  dU *= length ** 3
+            bV *= length;  cV *= length ** 2;  dV *= length ** 3
+
+        self._aU = aU; self._bU = bU; self._cU = cU; self._dU = dU
+        self._aV = aV; self._bV = bV; self._cV = cV; self._dV = dV
+        self._length = length
+
+        # Build arc-length → t LUT by sampling the curve at uniform t steps.
+        # Mirrors CubicBezier2D constructor in libOpenDRIVE/include/CubicBezier.hpp.
+        steps = self._LUT_STEPS
+        self._arclen_t: List[Tuple[float, float]] = [(0.0, 0.0)]
+        arclen = 0.0
+        prev_u, prev_v = self._eval_uv(0.0)
+        for i in range(1, steps + 1):
+            t = i / steps
+            u, v = self._eval_uv(t)
+            arclen += math.hypot(u - prev_u, v - prev_v)
+            self._arclen_t.append((arclen, t))
+            prev_u, prev_v = u, v
+
+        self._total_arclen = arclen
+
+    def _eval_uv(self, p: float) -> Tuple[float, float]:
+        """Evaluate the polynomial at parameter p ∈ [0, 1]."""
+        u = self._aU + self._bU * p + self._cU * p ** 2 + self._dU * p ** 3
+        v = self._aV + self._bV * p + self._cV * p ** 2 + self._dV * p ** 3
+        return u, v
+
+    def _arclen_to_t(self, s: float) -> float:
+        """Map arc length s (from segment start) to Bézier parameter t.
+
+        Mirrors CubicBezier2D::get_t() — linear interpolation within the LUT.
+        """
+        if self._total_arclen <= 0.0:
+            return 0.0
+        # Clamp s to valid range.
+        s = max(0.0, min(s, self._total_arclen))
+        # Binary search in the LUT.
+        lo, hi = 0, len(self._arclen_t) - 1
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if self._arclen_t[mid][0] <= s:
+                lo = mid
+            else:
+                hi = mid
+        al0, t0 = self._arclen_t[lo]
+        al1, t1 = self._arclen_t[hi]
+        if al1 == al0:
+            return t0
+        return t0 + (s - al0) / (al1 - al0) * (t1 - t0)
+
+    def _arclen_s_to_t(self, ds: float) -> float:
+        """Map arc-length offset from segment start to Bézier parameter t."""
+        if self._length > 0:
+            s_norm = ds / self._length * self._total_arclen
+        else:
+            s_norm = 0.0
+        return self._arclen_to_t(s_norm)
+
+    def get_xy(self, ds: float, x0: float, y0: float, hdg: float) -> Tuple[float, float]:
+        """Compute world (x, y) for arc-length offset ds from segment start.
+
+        Mirrors ParamPoly3::get_xy() in libOpenDRIVE.
+        """
+        t = self._arclen_s_to_t(ds)
+        u, v = self._eval_uv(t)
+        cos_h = math.cos(hdg)
+        sin_h = math.sin(hdg)
+        x = x0 + u * cos_h - v * sin_h
+        y = y0 + u * sin_h + v * cos_h
+        return x, y
+
+    def get_tangent(self, ds: float, hdg: float) -> Tuple[float, float]:
+        """Compute the analytic unit tangent (dx, dy) at arc-length offset ds.
+
+        Mirrors ParamPoly3::derivative() in libOpenDRIVE, which evaluates the
+        Bézier derivative and rotates it by hdg.
+        """
+        t = self._arclen_s_to_t(ds)
+        # Derivative of the cubic polynomial w.r.t. p
+        du = self._bU + 2.0 * self._cU * t + 3.0 * self._dU * t ** 2
+        dv = self._bV + 2.0 * self._cV * t + 3.0 * self._dV * t ** 2
+        cos_h = math.cos(hdg)
+        sin_h = math.sin(hdg)
+        dx = cos_h * du - sin_h * dv
+        dy = sin_h * du + cos_h * dv
+        n = math.hypot(dx, dy)
+        if n > 0:
+            return dx / n, dy / n
+        return math.cos(hdg), math.sin(hdg)
 
 
 def _normalize_3d(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
@@ -45,18 +198,6 @@ def _cross_product(
         a[0] * b[1] - a[1] * b[0],
     )
 
-
-def _compute_3d_tangent(
-    ref_line: List[Point3D], i: int
-) -> Tuple[float, float, float]:
-    """Computes the 3D tangent vector (e_s) at a point on the reference line.
-    
-    Uses central difference between neighboring points.
-    """
-    n = len(ref_line)
-    p1 = ref_line[max(0, i - 1)]
-    p2 = ref_line[min(n - 1, i + 1)]
-    return _normalize_3d((p2.x - p1.x, p2.y - p1.y, p2.z - p1.z))
 
 
 def _compute_e_t(
@@ -372,7 +513,7 @@ class XodrParser:
             elevation_profile = self._parse_elevation_profile(road)
             superelevation_profile, crossfall_profile = self._parse_lateral_profile(road)
 
-            # 2. Parse Reference Line (planView) — returns (Point3D, s) pairs sampled along segments
+            # 2. Parse Reference Line (planView) — returns (Point3D, s, (dx,dy)) triples
             ref_line_with_s = self._parse_plan_view(
                 road, elevation_profile=elevation_profile
             )
@@ -412,7 +553,7 @@ class XodrParser:
             # lane section boundaries + lane_offset/superelevation change-points
             # + per-lane width entry boundaries.
             # Mirrors libOpenDRIVE Road::get_lane_mesh s-value union strategy.
-            road_s_start = ref_line_with_s[0][1]
+            road_s_start = ref_line_with_s[0][1]   # index 1 = s value
             road_s_end = ref_line_with_s[-1][1]
             extra_s: set = set()
 
@@ -466,17 +607,18 @@ class XodrParser:
                 # section boundary. The last section uses s0 <= s.
                 if is_last_section:
                     section_pts_with_s = [
-                        (pt, s) for pt, s in ref_line_with_s if s >= s0
+                        (pt, s, dxy) for pt, s, dxy in ref_line_with_s if s >= s0
                     ]
                 else:
                     section_pts_with_s = [
-                        (pt, s) for pt, s in ref_line_with_s if s0 <= s <= s1
+                        (pt, s, dxy) for pt, s, dxy in ref_line_with_s if s0 <= s <= s1
                     ]
                 if not section_pts_with_s:
                     continue
 
-                ref_pts = [pt for pt, _ in section_pts_with_s]
-                s_vals = [s for _, s in section_pts_with_s]
+                ref_pts = [pt for pt, _, _ in section_pts_with_s]
+                s_vals = [s for _, s, _ in section_pts_with_s]
+                tangents = [dxy for _, _, dxy in section_pts_with_s]
 
                 # Compute lane offset at each sampled s point
                 lane_offsets = [lane_offset_profile.get_offset(s) for s in s_vals]
@@ -502,6 +644,7 @@ class XodrParser:
                             inner_offsets,
                             outer_offsets,
                             s_vals,
+                            tangents,
                             is_left=True,
                             superelevation_profile=superelevation_profile,
                             crossfall_profile=crossfall_profile,
@@ -532,6 +675,7 @@ class XodrParser:
                             inner_offsets,
                             outer_offsets,
                             s_vals,
+                            tangents,
                             is_left=False,
                             superelevation_profile=superelevation_profile,
                             crossfall_profile=crossfall_profile,
@@ -647,8 +791,24 @@ class XodrParser:
         road: ET.Element,
         eps: float = 0.1,
         elevation_profile: Optional[ElevationProfile] = None,
-    ) -> List[Tuple[Point3D, float]]:
-        """Parse the reference line geometries into a list of (Point3D, s) pairs.
+    ) -> List[Tuple[Point3D, float, Tuple[float, float]]]:
+        """Parse the reference line geometries into a list of (Point3D, s, (dx, dy)) triples.
+
+        Each entry contains:
+        - Point3D: world position (x, y, z)
+        - s: arc-length coordinate along the reference line
+        - (dx, dy): analytic 2D tangent direction (unit vector in the XY plane).
+
+        Using analytic derivatives instead of finite differences mirrors
+        RefLine::derivative() in libOpenDRIVE/src/RefLine.cpp, which calls each
+        geometry's derivative() method (Arc::derivative, Spiral::derivative, etc.)
+        rather than approximating from sampled points.
+
+        Geometry types and their tangent formulas:
+        - Line:       [cos(hdg), sin(hdg)]  (constant)
+        - Arc:        [sin(π/2 - κ(s-s0) - hdg), cos(π/2 - κ(s-s0) - hdg)]
+        - Spiral:     derived from odrSpiral tangent angle t = s²·c_dot/2
+        - ParamPoly3: derivative of (u(p), v(p)) rotated by hdg, normalised
 
         Uses adaptive sampling per geometry type, mirroring libOpenDRIVE:
         - Line: endpoints only (already linear).
@@ -661,7 +821,7 @@ class XodrParser:
         if plan_view is None:
             return []
 
-        pts: List[Tuple[Point3D, float]] = []
+        pts: List[Tuple[Point3D, float, Tuple[float, float]]] = []
         for geom in plan_view.findall("geometry"):
             s_start = float(geom.get("s", 0))
             x0 = float(geom.get("x", 0))
@@ -731,37 +891,64 @@ class XodrParser:
             if spiral_elem is not None:
                 curv_start_sp = float(spiral_elem.get("curvStart", 0))
                 curv_end_sp = float(spiral_elem.get("curvEnd", 0))
-                dcurv = (curv_end_sp - curv_start_sp) / length if length > 0 else 0.0
+                c_dot_sp = (
+                    (curv_end_sp - curv_start_sp) / length if length > 0 else 0.0
+                )
+                # s-offset in the standard spiral (starting at curv=0) that
+                # corresponds to the start of this geometry segment.
+                # Mirrors Spiral::Spiral() in libOpenDRIVE: s0_spiral = curv_start / c_dot
+                s0_spiral_sp = curv_start_sp / c_dot_sp if abs(c_dot_sp) > 1e-12 else 0.0
+                x0_spiral_sp, y0_spiral_sp, a0_spiral_sp = (
+                    _odr_spiral(s0_spiral_sp, c_dot_sp)
+                    if abs(c_dot_sp) > 1e-12
+                    else (0.0, 0.0, 0.0)
+                )
             if pp3_elem is not None:
-                aU = float(pp3_elem.get("aU", 0))
-                bU = float(pp3_elem.get("bU", 0))
-                cU = float(pp3_elem.get("cU", 0))
-                dU = float(pp3_elem.get("dU", 0))
-                aV = float(pp3_elem.get("aV", 0))
-                bV = float(pp3_elem.get("bV", 0))
-                cV = float(pp3_elem.get("cV", 0))
-                dV = float(pp3_elem.get("dV", 0))
-                p_range = pp3_elem.get("pRange", "normalized")
-                cos_h = math.cos(hdg)
-                sin_h = math.sin(hdg)
+                pp3 = _ParamPoly3(
+                    aU=float(pp3_elem.get("aU", 0)),
+                    bU=float(pp3_elem.get("bU", 0)),
+                    cU=float(pp3_elem.get("cU", 0)),
+                    dU=float(pp3_elem.get("dU", 0)),
+                    aV=float(pp3_elem.get("aV", 0)),
+                    bV=float(pp3_elem.get("bV", 0)),
+                    cV=float(pp3_elem.get("cV", 0)),
+                    dV=float(pp3_elem.get("dV", 0)),
+                    length=length,
+                    p_range=pp3_elem.get("pRange", "normalized"),
+                )
 
-            # For spiral: integrate heading incrementally — must iterate in order
+            # For spiral: compute each point independently via Fresnel integrals.
+            # Mirrors Spiral::get_xy() and Spiral::derivative() in libOpenDRIVE.
             if spiral_elem is not None:
-                sorted_s = sorted(s_set)
-                x, y = x0, y0
-                prev_s = s_start
-                for s_curr in sorted_s:
-                    if s_curr == s_start:
-                        if not skip_first:
-                            pts.append((Point3D(x, y, _z(s_start)), s_start))
+                hdg_offset = hdg - a0_spiral_sp
+                for s_curr in sorted(s_set):
+                    if s_curr == s_start and skip_first:
                         continue
-                    ds_step = s_curr - prev_s
-                    ds_mid = (prev_s - s_start) + ds_step / 2.0
-                    h_mid = hdg + curv_start_sp * ds_mid + 0.5 * dcurv * ds_mid**2
-                    x += ds_step * math.cos(h_mid)
-                    y += ds_step * math.sin(h_mid)
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr))
-                    prev_s = s_curr
+                    if abs(c_dot_sp) <= 1e-12:
+                        # Degenerate spiral: straight line tangent
+                        ds = s_curr - s_start
+                        x = x0 + ds * math.cos(hdg)
+                        y = y0 + ds * math.sin(hdg)
+                        dx, dy = math.cos(hdg), math.sin(hdg)
+                    else:
+                        xs_sp, ys_sp, as_sp = _odr_spiral(
+                            s_curr - s_start + s0_spiral_sp, c_dot_sp
+                        )
+                        x = (
+                            math.cos(hdg_offset) * (xs_sp - x0_spiral_sp)
+                            - math.sin(hdg_offset) * (ys_sp - y0_spiral_sp)
+                            + x0
+                        )
+                        y = (
+                            math.sin(hdg_offset) * (xs_sp - x0_spiral_sp)
+                            + math.cos(hdg_offset) * (ys_sp - y0_spiral_sp)
+                            + y0
+                        )
+                        # Tangent angle in global frame = as_sp + hdg - a0_spiral_sp
+                        # Mirrors Spiral::derivative() in libOpenDRIVE.
+                        tang_angle = as_sp + hdg_offset
+                        dx, dy = math.cos(tang_angle), math.sin(tang_angle)
+                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
             else:
                 for s_curr in sorted(s_set):
                     if s_curr == s_start and skip_first:
@@ -771,10 +958,13 @@ class XodrParser:
                     if geom.find("line") is not None:
                         x = x0 + ds * math.cos(hdg)
                         y = y0 + ds * math.sin(hdg)
+                        # Tangent is constant for a line segment.
+                        dx, dy = math.cos(hdg), math.sin(hdg)
                     elif arc_elem is not None:
                         if abs(curvature) < 1e-12:
                             x = x0 + ds * math.cos(hdg)
                             y = y0 + ds * math.sin(hdg)
+                            dx, dy = math.cos(hdg), math.sin(hdg)
                         else:
                             radius = 1.0 / curvature
                             cx = x0 - radius * math.sin(hdg)
@@ -782,17 +972,16 @@ class XodrParser:
                             theta = hdg - math.pi / 2 + ds * curvature
                             x = cx + radius * math.cos(theta)
                             y = cy + radius * math.sin(theta)
+                            # Mirrors Arc::derivative() in libOpenDRIVE.
+                            dx = math.sin(math.pi / 2 - curvature * ds - hdg)
+                            dy = math.cos(math.pi / 2 - curvature * ds - hdg)
                     elif pp3_elem is not None:
-                        t = ds / length if length > 0 else 0.0
-                        p = ds if p_range == "arcLength" else t
-                        u = aU + bU * p + cU * p**2 + dU * p**3
-                        v = aV + bV * p + cV * p**2 + dV * p**3
-                        x = x0 + u * cos_h - v * sin_h
-                        y = y0 + u * sin_h + v * cos_h
+                        x, y = pp3.get_xy(ds, x0, y0, hdg)
+                        dx, dy = pp3.get_tangent(ds, hdg)
                     else:
                         continue
 
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr))
+                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
 
         return pts
 
@@ -804,6 +993,7 @@ class XodrParser:
         inner_offsets: List[float],
         outer_offsets: List[float],
         s_vals: List[float],
+        tangents: List[Tuple[float, float]],
         is_left: bool,
         superelevation_profile: "SuperelevationProfile",
         crossfall_profile: "CrossfallProfile",
@@ -826,6 +1016,11 @@ class XodrParser:
         if lane_type not in ["driving", "sidewalk", "biking", "shoulder"]:
             return None
 
+        # level=true means this lane should remain horizontal even when the road
+        # has superelevation (banking). Mirrors the lane.level branch in
+        # Road::get_surface_pt() in libOpenDRIVE/src/Road.cpp (lines 178-183).
+        lane_level = lane_tag.get("level", "false").lower() == "true"
+
         center_pts = []
         inner_pts = []
         outer_pts = []
@@ -836,7 +1031,19 @@ class XodrParser:
             px, py, pz = ref_line[i].x, ref_line[i].y, ref_line[i].z
 
             # 1. Compute local orthonormal frame (e_s, e_t, e_h)
-            e_s = _compute_3d_tangent(ref_line, i)
+            # Use the analytic tangent stored alongside each reference-line point.
+            # elevation dz/ds is approximated by central difference — this is minor
+            # since dz is small compared to the xy tangent for typical roads.
+            dx2d, dy2d = tangents[i]
+            n = len(ref_line)
+            dz = (ref_line[min(n - 1, i + 1)].z - ref_line[max(0, i - 1)].z) / max(
+                1e-12,
+                math.hypot(
+                    ref_line[min(n - 1, i + 1)].x - ref_line[max(0, i - 1)].x,
+                    ref_line[min(n - 1, i + 1)].y - ref_line[max(0, i - 1)].y,
+                ),
+            )
+            e_s = _normalize_3d((dx2d, dy2d, dz))
             theta = superelevation_profile.get_value(s)
             e_t = _compute_e_t(e_s, theta)
             e_h = _normalize_3d(_cross_product(e_s, e_t))
@@ -846,14 +1053,27 @@ class XodrParser:
             oo = outer_offsets[i]
             co = (io + oo) / 2.0
 
-            # 3. Apply Crossfall: h_t = -tan(crossfall) * |t|
-            # This creates a slight lateral slope for drainage.
+            # 3. Compute h_t (height offset) for a given lateral offset t_offset.
+            #
+            # Normal case (level=false):
+            #   h_t = -tan(crossfall) * |t|
+            #
+            # level=true case: the lane surface is kept horizontal regardless of
+            # superelevation. Crossfall is applied relative to the inner border,
+            # then superelevation is added back to cancel out the road tilt so the
+            # lane appears flat. Mirrors the level=true branch in get_surface_pt().
             crossfall = crossfall_profile.get_crossfall(s, is_left)
             tan_cf = math.tan(crossfall)
 
             def _make_pt(t_offset: float) -> Point3D:
                 """Projects a point from the reference line using local coordinates."""
-                h_t = -tan_cf * abs(t_offset)
+                if lane_level:
+                    # Cancel superelevation: use inner border as crossfall base,
+                    # then tilt back by superelevation angle over (t - t_inner).
+                    h_inner = -tan_cf * abs(io)
+                    h_t = h_inner + math.tan(theta) * (t_offset - io)
+                else:
+                    h_t = -tan_cf * abs(t_offset)
                 return Point3D(
                     px + e_t[0] * t_offset + e_h[0] * h_t,
                     py + e_t[1] * t_offset + e_h[1] * h_t,
@@ -892,13 +1112,14 @@ class XodrParser:
 
 
 def _insert_boundary_points(
-    ref_line_with_s: List[Tuple[Point3D, float]],
+    ref_line_with_s: List[Tuple[Point3D, float, Tuple[float, float]]],
     boundary_s_values: List[float],
-) -> List[Tuple[Point3D, float]]:
+) -> List[Tuple[Point3D, float, Tuple[float, float]]]:
     """Ensures that lane section boundaries are explicitly represented in the ref line.
 
-    This prevents geometric "seams" or gaps between adjacent lane sections by 
-    interpolating and inserting points at the exact s-coordinates where sections start/end.
+    This prevents geometric "seams" or gaps between adjacent lane sections by
+    interpolating and inserting points at the exact s-coordinates where sections
+    start/end. The analytic tangent is linearly interpolated as well.
     """
     result = list(ref_line_with_s)
     insert_offset = 0
@@ -913,17 +1134,22 @@ def _insert_boundary_points(
             continue  # point is already present
         if j == 0:
             continue  # target is before road start; skip
-            
-        # Interpolate between result[j-1] and result[j]
-        pt_a, s_a = result[j - 1]
-        pt_b, s_b = result[j]
+
+        # Interpolate position and tangent between result[j-1] and result[j]
+        pt_a, s_a, dxy_a = result[j - 1]
+        pt_b, s_b, dxy_b = result[j]
         t = (s_target - s_a) / (s_b - s_a)
         pt_new = Point3D(
             pt_a.x + t * (pt_b.x - pt_a.x),
             pt_a.y + t * (pt_b.y - pt_a.y),
             pt_a.z + t * (pt_b.z - pt_a.z),
         )
-        result.insert(j, (pt_new, s_target))
+        # Interpolate and re-normalise tangent
+        dx_new = dxy_a[0] + t * (dxy_b[0] - dxy_a[0])
+        dy_new = dxy_a[1] + t * (dxy_b[1] - dxy_a[1])
+        n = math.hypot(dx_new, dy_new)
+        dxy_new = (dx_new / n, dy_new / n) if n > 0 else dxy_a
+        result.insert(j, (pt_new, s_target, dxy_new))
         insert_offset = j + 1
     return result
 
