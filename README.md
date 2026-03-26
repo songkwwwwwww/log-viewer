@@ -49,26 +49,7 @@ If you already have an `.xodr` map and a log file matching the documented JSON/J
 uv run log-viewer-replay --map path/to/map.xodr --log path/to/log.jsonl
 ```
 
-This command parses the map, loads all frames from the log, and sends them to the Rerun viewer for timeline-based inspection.
-
-If your log coordinates are in the `sim` frame and need alignment with the map's `xodr_enu` frame, you can also provide an optional metadata file:
-
-```bash
-uv run log-viewer-replay --map path/to/map.xodr --log path/to/log.jsonl --meta path/to/log.meta.json
-```
-
-Example metadata file:
-
-```json
-{
-  "sim_to_xodr_enu": [
-    [1.0, 0.0, 0.0, 10.0],
-    [0.0, 1.0, 0.0, 20.0],
-    [0.0, 0.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0]
-  ]
-}
-```
+This command parses the map, loads all frames from the log, and sends them to the Rerun viewer for timeline-based inspection
 
 ---
 
