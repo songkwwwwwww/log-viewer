@@ -49,7 +49,7 @@ If you already have an `.xodr` map and a log file matching the documented JSON/J
 uv run log-viewer-replay --map path/to/map.xodr --log path/to/log.jsonl
 ```
 
-This command parses the map, loads all frames from the log, and sends them to the Rerun viewer for timeline-based inspection
+This command parses the map, loads all frames from the log, and sends them to the Rerun viewer for timeline-based inspection.
 
 ---
 
@@ -85,7 +85,19 @@ Loads OpenDRIVE (`.xodr`) maps. It currently supports `line` and `arc` segments 
 
 ### 2. Simulation Log (.json / .jsonl)
 
-Supports single JSON arrays or line-delimited JSON (JSONL) matching the `SceneFrame` structure.
+Supports either a single JSON array or line-delimited JSON (JSONL), where each
+record is a frame containing an `objects` list. The parser converts that list
+into the in-memory `SceneFrame.objects` dictionary keyed by object ID.
+
+Recognized object fields:
+
+- `id` and `type`
+- `sub_type` (optional, defaults to `"unknown"`)
+- `is_static` (optional, defaults to `false`)
+- `position`, `velocity`, and `acceleration`
+- `orientation`
+- `size`
+- `future_trajectory` (optional)
 
 ```json
 [
@@ -95,6 +107,8 @@ Supports single JSON arrays or line-delimited JSON (JSONL) matching the `SceneFr
       {
         "id": "car_001",
         "type": "vehicle",
+        "sub_type": "car",
+        "is_static": false,
         "position": {"x": 10.5, "y": -2.0, "z": 0.0},
         "velocity": {"x": 5.0, "y": 0.0, "z": 0.0},
         "acceleration": {"x": 0.0, "y": 0.0, "z": 0.0},
@@ -113,13 +127,16 @@ Supports single JSON arrays or line-delimited JSON (JSONL) matching the `SceneFr
 ]
 ```
 
-*(For detailed data hierarchy, refer to `docs/design-doc.md`.)*
+In memory, the same frame becomes a `SceneFrame(timestamp=..., objects={...})`
+where `objects["car_001"]` is an `ObjectState`.
 
-### 3. Optional Log Metadata (.json)
+*(For the internal data hierarchy, refer to `docs/design-doc.md`.)*
 
-An optional metadata file may be provided alongside the log to define the coordinate transform from `sim` to `xodr_enu`. When present, the parser applies it to each object's position and future trajectory points as frames are loaded.
+### 3. Internal Python Models
 
-Supported keys:
+The runtime data model is split across dedicated modules:
 
-- `sim_to_xodr_enu`: preferred 4x4 homogeneous transform
-- `xodr_enu_to_sim`: accepted as an alternative and inverted internally
+- `geometry.py`: `Point3D`, `Quaternion`
+- `map_model.py`: `LaneBoundary`, `Lane`, `RoadLink`, `XodrMapData`
+- `scene_model.py`: `PoseAtTime`, `ObjectState`, `SceneFrame`
+- `data_model.py`: backward-compatible re-exports for older imports

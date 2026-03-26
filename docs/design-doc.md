@@ -189,7 +189,9 @@ class PoseAtTime:
 class ObjectState:
     id: str                                  # Unique ID (ex: "car_001")
     type: str                                # vehicle, pedestrian, etc.
-    position: Point3D                        # center point or rear-axle (x, y, z)
+    sub_type: str                            # optional subclass/color hint
+    is_static: bool                          # stationary object flag
+    position: Point3D                        # object center (x, y, z)
     velocity: Point3D                        # (vx, vy, vz)
     acceleration: Point3D                    # (ax, ay, az)
     orientation: Quaternion                  # rotation in 3D (w, x, y, z)
@@ -204,7 +206,9 @@ class SceneFrame:
 
 ### 5.4 JSON Log Format
 
-Standard structure for frame-by-frame logging. Supports JSON arrays or JSON Lines (JSONL).
+Standard structure for frame-by-frame logging. Supports JSON arrays or JSON
+Lines (JSONL). In the file format, each frame stores `objects` as a list. The
+parser converts that list into the in-memory `SceneFrame.objects` dictionary.
 
 ```json
 [
@@ -214,6 +218,8 @@ Standard structure for frame-by-frame logging. Supports JSON arrays or JSON Line
       {
         "id": "car_001",
         "type": "vehicle",
+        "sub_type": "car",
+        "is_static": false,
         "position": {"x": 10.5, "y": -2.0, "z": 0.0},
         "velocity": {"x": 5.0, "y": 0.0, "z": 0.0},
         "acceleration": {"x": 0.0, "y": 0.0, "z": 0.0},
@@ -233,6 +239,7 @@ Standard structure for frame-by-frame logging. Supports JSON arrays or JSON Line
 ```
 
 - **JSON Lines (.jsonl)**: For very large logs, `.jsonl` is more efficient than a single massive array.
+- **Optional fields**: `sub_type`, `is_static`, and `future_trajectory` may be omitted; the parser fills defaults.
 
 ---
 
