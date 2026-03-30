@@ -53,6 +53,25 @@ class Lane:
 
 
 @dataclass
+class RoadMark:
+    """A single road marking segment (solid line, dashed segment, etc.).
+
+    Mirrors the RoadMark struct in libOpenDRIVE/include/RoadMark.h.
+
+    Attributes:
+        left_pts: 3D points along the left (inner) edge of the mark.
+        right_pts: 3D points along the right (outer) edge of the mark.
+        mark_type: Marking type string (e.g. "solid", "broken").
+        color: Color hint from OpenDRIVE (e.g. "white", "yellow", "standard").
+    """
+
+    left_pts: List[Point3D]
+    right_pts: List[Point3D]
+    mark_type: str
+    color: str
+
+
+@dataclass
 class RoadLink:
     """Represents a directional connection between two roads in OpenDRIVE.
 
@@ -82,12 +101,16 @@ class XodrMapData:
     Attributes:
         lanes: List of all parsed Lane objects.
         road_links: List of connectivity links between roads.
+        road_marks: List of all parsed RoadMark objects.
     """
 
     lanes: List[Lane]
     road_links: List[RoadLink] = None
+    road_marks: List[RoadMark] = None
 
     def __post_init__(self):
         """Initialize mutable defaults."""
         if self.road_links is None:
             self.road_links = []
+        if self.road_marks is None:
+            self.road_marks = []

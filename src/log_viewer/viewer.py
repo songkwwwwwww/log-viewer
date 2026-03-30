@@ -24,6 +24,17 @@ _LANE_COLORS = {
     "shoulder": [100, 95, 90, 255],
 }
 
+# Road mark color palette [R, G, B, A] — keyed by OpenDRIVE color attribute.
+_ROAD_MARK_COLORS = {
+    "white": [255, 255, 255, 255],
+    "yellow": [255, 220, 0, 255],
+    "standard": [255, 255, 255, 255],
+    "blue": [0, 100, 255, 255],
+    "green": [0, 200, 80, 255],
+    "red": [220, 50, 50, 255],
+    "orange": [255, 140, 0, 255],
+}
+
 # Object type colors [R, G, B] — fallback when sub_type is not recognized.
 _OBJECT_COLORS = {
     "vehicle": [0, 100, 255],
@@ -225,6 +236,35 @@ class LogViewer:
                     ),
                     static=True,
                 )
+
+        # ---------- Road marks (Mesh3D quad strips) ----------
+        for mark_idx, mark in enumerate(map_data.road_marks):
+            left_pts = mark.left_pts
+            right_pts = mark.right_pts
+            if len(left_pts) != len(right_pts) or len(left_pts) < 2:
+                continue
+            vertices = []
+            indices = []
+            for i in range(len(left_pts)):
+                vertices.append([left_pts[i].x, left_pts[i].y, left_pts[i].z])
+                vertices.append([right_pts[i].x, right_pts[i].y, right_pts[i].z])
+                if i < len(left_pts) - 1:
+                    idx_a1 = 2 * i
+                    idx_b1 = 2 * i + 1
+                    idx_a2 = 2 * i + 2
+                    idx_b2 = 2 * i + 3
+                    indices.append([idx_a1, idx_b1, idx_a2])
+                    indices.append([idx_b1, idx_b2, idx_a2])
+            color = _ROAD_MARK_COLORS.get(mark.color, [255, 255, 255, 255])
+            rr.log(
+                f"map/road_marks/{mark_idx}",
+                rr.Mesh3D(
+                    vertex_positions=vertices,
+                    triangle_indices=indices,
+                    albedo_factor=color,
+                ),
+                static=True,
+            )
 
     def render_state(self, frame: SceneFrame):
         """Render a single frame of simulation state.

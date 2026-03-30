@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple
 from scipy.special import fresnel as _scipy_fresnel
 
 from .geometry import Point3D
-from .map_model import Lane, LaneBoundary, RoadLink, XodrMapData
+from .map_model import Lane, LaneBoundary, RoadLink, RoadMark, XodrMapData
 
 # Linearization tolerance (metres) used for adaptive sampling — mirrors the eps
 # value passed to libOpenDRIVE's approximate_linear() calls.
@@ -110,6 +110,11 @@ class _ParamPoly3:
             prev_u, prev_v = u, v
 
         self._total_arclen = arclen
+        # Mirror libOpenDRIVE ParamPoly3.cpp:41: cubic_bezier.arclen_t[length]=1.0.
+        # This sentinel pins ds=length → t=1 so that get_t(ds) accepts the full
+        # OpenDRIVE s-coordinate range [0, length] directly.
+        if length > 0:
+            self._arclen_t.append((length, 1.0))
 
     def _eval_uv(self, p: float) -> Tuple[float, float]:
         """Evaluate the polynomial at parameter p ∈ [0, 1]."""
@@ -122,10 +127,13 @@ class _ParamPoly3:
 
         Mirrors CubicBezier2D::get_t() — linear interpolation within the LUT.
         """
-        if self._total_arclen <= 0.0:
+        if not self._arclen_t:
             return 0.0
-        # Clamp s to valid range.
-        s = max(0.0, min(s, self._total_arclen))
+        max_arclen = self._arclen_t[-1][0]
+        if max_arclen <= 0.0:
+            return 0.0
+        # Clamp to valid range (mirrors: arclen_adj = min(arclen, valid_length)).
+        s = max(0.0, min(s, max_arclen))
         # Binary search in the LUT.
         lo, hi = 0, len(self._arclen_t) - 1
         while lo + 1 < hi:
@@ -141,12 +149,13 @@ class _ParamPoly3:
         return t0 + (s - al0) / (al1 - al0) * (t1 - t0)
 
     def _arclen_s_to_t(self, ds: float) -> float:
-        """Map arc-length offset from segment start to Bézier parameter t."""
-        if self._length > 0:
-            s_norm = ds / self._length * self._total_arclen
-        else:
-            s_norm = 0.0
-        return self._arclen_to_t(s_norm)
+        """Map arc-length offset from segment start to Bézier parameter t.
+
+        Mirrors ParamPoly3::get_xy(s): cubic_bezier.get_t(s - s0).
+        The LUT is keyed by OpenDRIVE arc-length (with arclen_t[length]=1.0),
+        so ds can be passed directly without rescaling.
+        """
+        return self._arclen_to_t(ds)
 
     def get_xy(self, ds: float, x0: float, y0: float, hdg: float) -> Tuple[float, float]:
         """Compute world (x, y) for arc-length offset ds from segment start.
@@ -536,14 +545,17 @@ def _zero_cubic_profile() -> _CubicProfile:
 
 
 def _thin_s_values(s_values: List[float], eps: float) -> List[float]:
-    """Remove redundant sample points closer than eps, mirroring libOpenDRIVE."""
+    """Remove redundant sample points closer than eps, mirroring libOpenDRIVE.
+
+    Mirrors the thinning loop in Road::get_lane_mesh() (Road.cpp): iterates
+    forward and removes s_iter+1 when it is within eps of s_iter, but never
+    removes the last point (std::next(s_iter, 2) != end() guard).
+    """
     result = list(s_values)
     idx = 0
     while idx + 2 < len(result):
         if (result[idx + 1] - result[idx]) <= eps:
             result.pop(idx + 1)
-            if idx > 0:
-                idx -= 1
         else:
             idx += 1
     return result
@@ -797,6 +809,7 @@ class XodrParser:
         """Parse the OpenDRIVE XML into XodrMapData."""
         lanes_to_render = []
         road_links = []
+        road_marks_to_render = []
 
         # First pass: collect reference line endpoints per road to resolve connectivity
         road_ref_endpoints: dict = {}
@@ -871,6 +884,34 @@ class XodrParser:
                 )
                 zero_profile = _zero_cubic_profile()
 
+                # Process center lane (id=0) road marks — outer border is the
+                # reference line itself offset by lane_offset_cubic (width=0).
+                center = lane_section.find("center")
+                if center is not None:
+                    center_section_pts = self._parse_plan_view(
+                        road,
+                        elevation_profile=elevation_profile,
+                        sample_s_values=[
+                            s for s in road_sample_s_values
+                            if s0 <= s <= s1
+                        ],
+                    )
+                    if center_section_pts:
+                        center_s_vals = [s for _, s, _ in center_section_pts]
+                        for lane_tag in center.findall("lane"):
+                            road_marks_to_render.extend(
+                                self._parse_roadmarks_for_lane(
+                                    lane_tag,
+                                    s0,
+                                    s1,
+                                    lane_offset_cubic,
+                                    center_section_pts,
+                                    center_s_vals,
+                                    elevation_profile,
+                                    superelevation_profile,
+                                )
+                            )
+
                 # Process left lanes (OpenDRIVE IDs are positive, build outward from center)
                 left = lane_section.find("left")
                 if left is not None:
@@ -929,6 +970,18 @@ class XodrParser:
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
+                        road_marks_to_render.extend(
+                            self._parse_roadmarks_for_lane(
+                                lane_tag,
+                                s0,
+                                s1,
+                                outer_border,
+                                section_pts_with_s,
+                                s_vals,
+                                elevation_profile,
+                                superelevation_profile,
+                            )
+                        )
                         prev_outer_no_offset = outer_no_offset
 
                 # Process right lanes (OpenDRIVE IDs are negative, build outward)
@@ -989,9 +1042,215 @@ class XodrParser:
                         )
                         if parsed_lane:
                             lanes_to_render.append(parsed_lane)
+                        road_marks_to_render.extend(
+                            self._parse_roadmarks_for_lane(
+                                lane_tag,
+                                s0,
+                                s1,
+                                outer_border,
+                                section_pts_with_s,
+                                s_vals,
+                                elevation_profile,
+                                superelevation_profile,
+                            )
+                        )
                         prev_outer_no_offset = outer_no_offset
 
-        return XodrMapData(lanes=lanes_to_render, road_links=road_links)
+        return XodrMapData(
+            lanes=lanes_to_render,
+            road_links=road_links,
+            road_marks=road_marks_to_render,
+        )
+
+    def _parse_roadmarks_for_lane(
+        self,
+        lane_tag: ET.Element,
+        s0: float,
+        s1: float,
+        outer_border: "_CubicProfile",
+        section_pts_with_s: List[Tuple["Point3D", float, Tuple[float, float]]],
+        s_vals: List[float],
+        elevation_profile: Optional["ElevationProfile"],
+        superelevation_profile: "SuperelevationProfile",
+    ) -> List[RoadMark]:
+        """Parse road mark geometry for a single lane.
+
+        Mirrors Road::get_roadmark_mesh() in libOpenDRIVE/src/Road.cpp.
+        For each <roadMark> element on the lane:
+          - Solid/continuous marks: one segment spanning the full roadmark range.
+          - Dashed marks (with <type><line> children): repeated dash segments.
+
+        Each segment's 3D quad is computed by placing two parallel edges at:
+          t_edge_a = outer_border(s) + width/2 + t_offset
+          t_edge_b = t_edge_a - width
+
+        Args:
+            lane_tag: The <lane> XML element.
+            s0: Lane section start s-coordinate.
+            s1: Lane section end s-coordinate.
+            outer_border: Lateral offset profile for the lane outer edge.
+            section_pts_with_s: Reference line samples (Point3D, s, tangent).
+            s_vals: Sorted s-values used for sampling this lane.
+            elevation_profile: Road elevation profile.
+            superelevation_profile: Road superelevation profile.
+
+        Returns:
+            List of RoadMark objects with 3D left_pts and right_pts.
+        """
+        _STANDARD_WIDTH = 0.12
+        _BOLD_WIDTH = 0.25
+
+        ref_pts = [pt for pt, _, _ in section_pts_with_s]
+        tangents = [dxy for _, _, dxy in section_pts_with_s]
+
+        def _surface_pt(s: float, t: float) -> Point3D:
+            """Compute 3D surface point at (s, t) — mirrors Road::get_surface_pt()."""
+            idx = bisect_right(s_vals, s) - 1
+            idx = max(0, min(idx, len(ref_pts) - 1))
+            px, py, pz = ref_pts[idx].x, ref_pts[idx].y, ref_pts[idx].z
+            dx2d, dy2d = tangents[idx]
+            dz = elevation_profile.get_dz(s) if elevation_profile else 0.0
+            e_s = _normalize_3d((dx2d, dy2d, dz))
+            theta = superelevation_profile.get_value(s)
+            e_t = _compute_e_t(e_s, theta)
+            return Point3D(
+                px + e_t[0] * t,
+                py + e_t[1] * t,
+                pz + e_t[2] * t,
+            )
+
+        result: List[RoadMark] = []
+        roadmark_tags = lane_tag.findall("roadMark")
+
+        for rm_idx, rm_tag in enumerate(roadmark_tags):
+            rm_s_offset = float(rm_tag.get("sOffset", 0.0))
+            rm_s_offset = max(0.0, rm_s_offset)
+            rm_s0 = s0 + rm_s_offset
+
+            # End of this roadmark group = start of next, or lane section end
+            if rm_idx + 1 < len(roadmark_tags):
+                next_offset = float(
+                    roadmark_tags[rm_idx + 1].get("sOffset", 0.0)
+                )
+                rm_s1 = s0 + max(0.0, next_offset)
+            else:
+                rm_s1 = s1
+
+            if rm_s0 >= rm_s1:
+                continue
+
+            rm_type = rm_tag.get("type", "none")
+            if rm_type == "none":
+                continue
+
+            rm_color = rm_tag.get("color", "standard")
+            rm_weight = rm_tag.get("weight", "standard")
+            rm_width_attr = float(rm_tag.get("width", -1))
+
+            base_width = _BOLD_WIDTH if rm_weight == "bold" else _STANDARD_WIDTH
+
+            type_node = rm_tag.find("type")
+            if type_node is not None:
+                # Dashed/patterned marks: iterate <line> children
+                line_width_type = float(type_node.get("width", -1))
+                for line_tag in type_node.findall("line"):
+                    lw0 = float(line_tag.get("width", -1))
+                    width = (
+                        lw0 if lw0 > 0
+                        else (line_width_type if line_width_type > 0 else base_width)
+                    )
+                    length = float(line_tag.get("length", 0.0))
+                    space = float(line_tag.get("space", 0.0))
+                    t_offset = float(line_tag.get("tOffset", 0.0))
+                    s_offset_line = max(0.0, float(line_tag.get("sOffset", 0.0)))
+
+                    if (length + space) == 0:
+                        continue
+
+                    s_start_dash = rm_s0 + s_offset_line
+                    while s_start_dash < rm_s1:
+                        s_end_dash = min(rm_s1, s_start_dash + length)
+                        if s_end_dash > s_start_dash:
+                            mark = self._compute_roadmark_geometry(
+                                s_start_dash,
+                                s_end_dash,
+                                t_offset,
+                                width,
+                                outer_border,
+                                s_vals,
+                                _surface_pt,
+                                rm_type,
+                                rm_color,
+                            )
+                            if mark is not None:
+                                result.append(mark)
+                        s_start_dash += length + space
+            else:
+                # Solid / continuous mark
+                width = (
+                    rm_width_attr if rm_width_attr > 0 else base_width
+                )
+                mark = self._compute_roadmark_geometry(
+                    rm_s0,
+                    rm_s1,
+                    0.0,
+                    width,
+                    outer_border,
+                    s_vals,
+                    _surface_pt,
+                    rm_type,
+                    rm_color,
+                )
+                if mark is not None:
+                    result.append(mark)
+
+        return result
+
+    def _compute_roadmark_geometry(
+        self,
+        s_start: float,
+        s_end: float,
+        t_offset: float,
+        width: float,
+        outer_border: "_CubicProfile",
+        s_vals: List[float],
+        surface_pt_fn,
+        mark_type: str,
+        color: str,
+    ) -> Optional[RoadMark]:
+        """Compute 3D quad-strip geometry for a single road mark segment.
+
+        Mirrors Road::get_roadmark_mesh() in libOpenDRIVE/src/Road.cpp:353-379.
+        Samples at s-values within [s_start, s_end] and computes two parallel
+        edges at t = outer_border(s) ± width/2 + t_offset.
+
+        Returns None if fewer than 2 sample points exist.
+        """
+        seg_s_vals = [s for s in s_vals if s_start <= s <= s_end]
+        if s_start not in seg_s_vals:
+            seg_s_vals = [s_start] + seg_s_vals
+        if s_end not in seg_s_vals:
+            seg_s_vals = seg_s_vals + [s_end]
+        seg_s_vals = sorted(set(seg_s_vals))
+
+        if len(seg_s_vals) < 2:
+            return None
+
+        left_pts: List[Point3D] = []
+        right_pts: List[Point3D] = []
+        for s in seg_s_vals:
+            outer = outer_border.evaluate(s)
+            t_a = outer + width * 0.5 + t_offset
+            t_b = t_a - width
+            left_pts.append(surface_pt_fn(s, t_a))
+            right_pts.append(surface_pt_fn(s, t_b))
+
+        return RoadMark(
+            left_pts=left_pts,
+            right_pts=right_pts,
+            mark_type=mark_type,
+            color=color,
+        )
 
     def _parse_lane_offset_profile(self, lanes: ET.Element) -> LaneOffsetProfile:
         """Parse all <laneOffset> entries from the <lanes> element."""
