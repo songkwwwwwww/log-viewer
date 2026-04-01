@@ -792,16 +792,246 @@ class CrossfallProfile:
         return active.a + active.b * ds + active.c * ds**2 + active.d * ds**3
 
 
+@dataclass
+class _GeomSegment:
+    """Cached descriptor for a single planView geometry element."""
+
+    kind: str  # "line", "arc", "spiral", "paramPoly3"
+    s_start: float
+    length: float
+    hdg: float
+    x0: float
+    y0: float
+    # Arc
+    curvature: float = 0.0
+    # Spiral (precomputed)
+    c_dot: float = 0.0
+    s0_spiral: float = 0.0
+    x0_spiral: float = 0.0
+    y0_spiral: float = 0.0
+    a0_spiral: float = 0.0
+    hdg_offset: float = 0.0
+    # ParamPoly3
+    pp3: Optional[_ParamPoly3] = None
+
+    @property
+    def s_end(self) -> float:
+        return self.s_start + self.length
+
+
+class _RoadGeometryCache:
+    """Caches parsed planView geometry for a road to avoid redundant XML parsing.
+
+    The original ``_parse_plan_view`` re-parses the XML ``<planView>`` element
+    and reconstructs ``_ParamPoly3`` objects (with 200-step LUT) on every call.
+    For a road with N lanes this happens N+3 times.  This class parses once and
+    stores lightweight ``_GeomSegment`` descriptors that can be evaluated at
+    arbitrary s-values cheaply.
+    """
+
+    def __init__(self, road: ET.Element) -> None:
+        self.segments: List[_GeomSegment] = []
+        plan_view = road.find("planView")
+        if plan_view is None:
+            return
+        for geom in plan_view.findall("geometry"):
+            s_start = float(geom.get("s", 0))
+            x0 = float(geom.get("x", 0))
+            y0 = float(geom.get("y", 0))
+            hdg = float(geom.get("hdg", 0))
+            length = float(geom.get("length", 0))
+
+            if geom.find("line") is not None:
+                self.segments.append(_GeomSegment(
+                    kind="line", s_start=s_start, length=length,
+                    hdg=hdg, x0=x0, y0=y0,
+                ))
+            elif geom.find("arc") is not None:
+                curvature = float(geom.find("arc").get("curvature", 0))
+                self.segments.append(_GeomSegment(
+                    kind="arc", s_start=s_start, length=length,
+                    hdg=hdg, x0=x0, y0=y0, curvature=curvature,
+                ))
+            elif geom.find("spiral") is not None:
+                sp = geom.find("spiral")
+                curv_start = float(sp.get("curvStart", 0))
+                curv_end = float(sp.get("curvEnd", 0))
+                c_dot = (curv_end - curv_start) / length if length > 0 else 0.0
+                s0_spiral = curv_start / c_dot if abs(c_dot) > 1e-12 else 0.0
+                if abs(c_dot) > 1e-12:
+                    x0_sp, y0_sp, a0_sp = _odr_spiral(s0_spiral, c_dot)
+                else:
+                    x0_sp, y0_sp, a0_sp = 0.0, 0.0, 0.0
+                self.segments.append(_GeomSegment(
+                    kind="spiral", s_start=s_start, length=length,
+                    hdg=hdg, x0=x0, y0=y0,
+                    c_dot=c_dot, s0_spiral=s0_spiral,
+                    x0_spiral=x0_sp, y0_spiral=y0_sp, a0_spiral=a0_sp,
+                    hdg_offset=hdg - a0_sp,
+                ))
+            elif geom.find("paramPoly3") is not None:
+                pp3_elem = geom.find("paramPoly3")
+                pp3 = _ParamPoly3(
+                    aU=float(pp3_elem.get("aU", 0)),
+                    bU=float(pp3_elem.get("bU", 0)),
+                    cU=float(pp3_elem.get("cU", 0)),
+                    dU=float(pp3_elem.get("dU", 0)),
+                    aV=float(pp3_elem.get("aV", 0)),
+                    bV=float(pp3_elem.get("bV", 0)),
+                    cV=float(pp3_elem.get("cV", 0)),
+                    dV=float(pp3_elem.get("dV", 0)),
+                    length=length,
+                    p_range=pp3_elem.get("pRange", "normalized"),
+                )
+                self.segments.append(_GeomSegment(
+                    kind="paramPoly3", s_start=s_start, length=length,
+                    hdg=hdg, x0=x0, y0=y0, pp3=pp3,
+                ))
+
+    def get_default_s_set(
+        self,
+        eps: float,
+        elevation_profile: Optional["ElevationProfile"] = None,
+    ) -> List[Tuple["Point3D", float, Tuple[float, float]]]:
+        """Evaluate using default adaptive sampling (no explicit s-values)."""
+        return self._evaluate_impl(eps, elevation_profile, sample_s_values=None)
+
+    def evaluate(
+        self,
+        sample_s_values: List[float],
+        elevation_profile: Optional["ElevationProfile"] = None,
+    ) -> List[Tuple["Point3D", float, Tuple[float, float]]]:
+        """Evaluate at explicit s-values."""
+        return self._evaluate_impl(0.1, elevation_profile, sample_s_values)
+
+    def _evaluate_impl(
+        self,
+        eps: float,
+        elevation_profile: Optional["ElevationProfile"],
+        sample_s_values: Optional[List[float]],
+    ) -> List[Tuple["Point3D", float, Tuple[float, float]]]:
+        """Core evaluation logic, mirrors the original _parse_plan_view."""
+        pts: List[Tuple[Point3D, float, Tuple[float, float]]] = []
+
+        def _z(s: float) -> float:
+            return elevation_profile.get_z(s) if elevation_profile else 0.0
+
+        for seg in self.segments:
+            skip_first = len(pts) > 0
+
+            # Build s-value sample set
+            if sample_s_values is not None:
+                s_set = {s for s in sample_s_values if seg.s_start <= s <= seg.s_end}
+                if not s_set:
+                    continue
+            else:
+                s_set: set = {seg.s_start, seg.s_end}
+                if elevation_profile:
+                    s_set.update(
+                        elevation_profile.get_sample_s_values(seg.s_start, seg.s_end, eps)
+                    )
+                if seg.kind == "line":
+                    pass  # endpoints only
+                elif seg.kind == "arc":
+                    if abs(seg.curvature) > 1e-12:
+                        s_step = 0.01 / abs(seg.curvature)
+                        s = seg.s_start
+                        while s < seg.s_end:
+                            s_set.add(s)
+                            s += s_step
+                elif seg.kind == "spiral":
+                    s_step = 10.0 * eps
+                    s = seg.s_start
+                    while s < seg.s_end:
+                        s_set.add(s)
+                        s += s_step
+                elif seg.kind == "paramPoly3":
+                    s_step = eps
+                    s = seg.s_start
+                    while s < seg.s_end:
+                        s_set.add(s)
+                        s += s_step
+
+            # Evaluate at each s-value
+            if seg.kind == "spiral":
+                for s_curr in sorted(s_set):
+                    if skip_first and abs(s_curr - seg.s_start) < 1e-9:
+                        continue
+                    if abs(seg.c_dot) <= 1e-12:
+                        ds = s_curr - seg.s_start
+                        x = seg.x0 + ds * math.cos(seg.hdg)
+                        y = seg.y0 + ds * math.sin(seg.hdg)
+                        dx, dy = math.cos(seg.hdg), math.sin(seg.hdg)
+                    else:
+                        xs_sp, ys_sp, as_sp = _odr_spiral(
+                            s_curr - seg.s_start + seg.s0_spiral, seg.c_dot
+                        )
+                        x = (
+                            math.cos(seg.hdg_offset) * (xs_sp - seg.x0_spiral)
+                            - math.sin(seg.hdg_offset) * (ys_sp - seg.y0_spiral)
+                            + seg.x0
+                        )
+                        y = (
+                            math.sin(seg.hdg_offset) * (xs_sp - seg.x0_spiral)
+                            + math.cos(seg.hdg_offset) * (ys_sp - seg.y0_spiral)
+                            + seg.y0
+                        )
+                        tang_angle = as_sp + seg.hdg_offset
+                        dx, dy = math.cos(tang_angle), math.sin(tang_angle)
+                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
+            else:
+                for s_curr in sorted(s_set):
+                    if skip_first and abs(s_curr - seg.s_start) < 1e-9:
+                        continue
+                    ds = s_curr - seg.s_start
+
+                    if seg.kind == "line":
+                        x = seg.x0 + ds * math.cos(seg.hdg)
+                        y = seg.y0 + ds * math.sin(seg.hdg)
+                        dx, dy = math.cos(seg.hdg), math.sin(seg.hdg)
+                    elif seg.kind == "arc":
+                        if abs(seg.curvature) < 1e-12:
+                            x = seg.x0 + ds * math.cos(seg.hdg)
+                            y = seg.y0 + ds * math.sin(seg.hdg)
+                            dx, dy = math.cos(seg.hdg), math.sin(seg.hdg)
+                        else:
+                            radius = 1.0 / seg.curvature
+                            cx = seg.x0 - radius * math.sin(seg.hdg)
+                            cy = seg.y0 + radius * math.cos(seg.hdg)
+                            theta = seg.hdg - math.pi / 2 + ds * seg.curvature
+                            x = cx + radius * math.cos(theta)
+                            y = cy + radius * math.sin(theta)
+                            dx = math.sin(math.pi / 2 - seg.curvature * ds - seg.hdg)
+                            dy = math.cos(math.pi / 2 - seg.curvature * ds - seg.hdg)
+                    elif seg.kind == "paramPoly3":
+                        x, y = seg.pp3.get_xy(ds, seg.x0, seg.y0, seg.hdg)
+                        dx, dy = seg.pp3.get_tangent(ds, seg.hdg)
+                    else:
+                        continue
+
+                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
+
+        return pts
+
+
 class XodrParser:
     """A minimal OpenDRIVE (XODR) parser for visualization purposes.
-    
+
     This parser extracts road geometries and lane structures, performing the 
     necessary coordinate transformations to generate 3D meshes.
     """
 
-    def __init__(self, file_path: str):
-        """Initialize parser from file path."""
+    def __init__(self, file_path: str, eps: float = _SAMPLING_EPS):
+        """Initialize parser from file path.
+
+        Args:
+            file_path: Path to the .xodr file.
+            eps: Linearization tolerance in metres for adaptive sampling.
+                 Lower values produce denser (more accurate) meshes; higher
+                 values speed up parsing at the cost of visual fidelity.
+        """
         self.file_path = file_path
+        self._eps = eps
         self.tree = ET.parse(file_path)
         self.root = self.tree.getroot()
 
@@ -811,24 +1041,28 @@ class XodrParser:
         road_links = []
         road_marks_to_render = []
 
-        # First pass: collect reference line endpoints per road to resolve connectivity
+        # First pass: build geometry caches and collect reference line endpoints
+        road_geom_caches: Dict[str, _RoadGeometryCache] = {}
         road_ref_endpoints: dict = {}
         for road in self.root.findall("road"):
             road_id = road.get("id", "unknown")
-            pts_with_s = self._parse_plan_view(road)
+            cache = _RoadGeometryCache(road)
+            road_geom_caches[road_id] = cache
+            pts_with_s = cache.get_default_s_set(self._eps)
             if pts_with_s:
                 road_ref_endpoints[road_id] = (pts_with_s[0][0], pts_with_s[-1][0])
 
         for road in self.root.findall("road"):
             road_id = road.get("id", "unknown")
+            geom_cache = road_geom_caches[road_id]
 
             # 1. Parse Profiles (Elevation, Superelevation, Crossfall)
             elevation_profile = self._parse_elevation_profile(road)
             superelevation_profile, crossfall_profile = self._parse_lateral_profile(road)
 
-            # 2. Parse Reference Line (planView) — returns (Point3D, s, (dx,dy)) triples
-            ref_line_with_s = self._parse_plan_view(
-                road, elevation_profile=elevation_profile
+            # 2. Evaluate Reference Line from cached geometry
+            ref_line_with_s = geom_cache.get_default_s_set(
+                self._eps, elevation_profile=elevation_profile
             )
             if not ref_line_with_s:
                 continue
@@ -888,13 +1122,9 @@ class XodrParser:
                 # reference line itself offset by lane_offset_cubic (width=0).
                 center = lane_section.find("center")
                 if center is not None:
-                    center_section_pts = self._parse_plan_view(
-                        road,
+                    center_section_pts = geom_cache.evaluate(
+                        [s for s in road_sample_s_values if s0 <= s <= s1],
                         elevation_profile=elevation_profile,
-                        sample_s_values=[
-                            s for s in road_sample_s_values
-                            if s0 <= s <= s1
-                        ],
                     )
                     if center_section_pts:
                         center_s_vals = [s for _, s, _ in center_section_pts]
@@ -942,16 +1172,15 @@ class XodrParser:
                             superelevation_profile,
                             lane_height,
                         )
-                        section_pts_with_s = self._parse_plan_view(
-                            road,
-                            elevation_profile=elevation_profile,
-                            sample_s_values=s_vals,
+                        section_pts_with_s = geom_cache.evaluate(
+                            s_vals, elevation_profile=elevation_profile,
                         )
                         if not section_pts_with_s:
                             prev_outer_no_offset = outer_no_offset
                             continue
                         ref_pts = [pt for pt, _, _ in section_pts_with_s]
                         tangents = [dxy for _, _, dxy in section_pts_with_s]
+                        s_vals = [s for _, s, _ in section_pts_with_s]
                         inner_offsets = [inner_border.evaluate(s) for s in s_vals]
                         outer_offsets = [outer_border.evaluate(s) for s in s_vals]
                         parsed_lane = self._process_lane(
@@ -1014,16 +1243,15 @@ class XodrParser:
                             superelevation_profile,
                             lane_height,
                         )
-                        section_pts_with_s = self._parse_plan_view(
-                            road,
-                            elevation_profile=elevation_profile,
-                            sample_s_values=s_vals,
+                        section_pts_with_s = geom_cache.evaluate(
+                            s_vals, elevation_profile=elevation_profile,
                         )
                         if not section_pts_with_s:
                             prev_outer_no_offset = outer_no_offset
                             continue
                         ref_pts = [pt for pt, _, _ in section_pts_with_s]
                         tangents = [dxy for _, _, dxy in section_pts_with_s]
+                        s_vals = [s for _, s, _ in section_pts_with_s]
                         inner_offsets = [inner_border.evaluate(s) for s in s_vals]
                         outer_offsets = [outer_border.evaluate(s) for s in s_vals]
                         parsed_lane = self._process_lane(
@@ -1328,15 +1556,15 @@ class XodrParser:
         s_vals = {
             s for s in road_sample_s_values if s_start <= s <= s_end
         }
-        s_vals.update(inner_border.get_sample_s_values(_SAMPLING_EPS, s_start, s_end))
-        s_vals.update(outer_border.get_sample_s_values(_SAMPLING_EPS, s_start, s_end))
+        s_vals.update(inner_border.get_sample_s_values(self._eps, s_start, s_end))
+        s_vals.update(outer_border.get_sample_s_values(self._eps, s_start, s_end))
         s_vals.update(lane_height_profile.get_sample_s_values(s_start, s_end))
 
         t_max = outer_border.max_value(s_start, s_end)
         superelev_eps = (
-            math.atan(_SAMPLING_EPS / abs(t_max))
+            math.atan(self._eps / abs(t_max))
             if abs(t_max) > 1e-12
-            else _SAMPLING_EPS
+            else self._eps
         )
         s_vals.update(
             superelevation_profile.get_sample_s_values(
@@ -1345,7 +1573,7 @@ class XodrParser:
         )
         s_vals.add(s_start)
         s_vals.add(s_end)
-        return _thin_s_values(sorted(s_vals), _SAMPLING_EPS)
+        return _thin_s_values(sorted(s_vals), self._eps)
 
     def _parse_elevation_profile(self, road: ET.Element) -> ElevationProfile:
         """Parse the elevationProfile for a road."""
@@ -1724,7 +1952,13 @@ class XodrParser:
             center_line=center_pts,
             is_left=is_left,
         )
-def parse_xodr(file_path: str) -> XodrMapData:
-    """Convenience function to parse an OpenDRIVE file into a map model."""
-    parser = XodrParser(file_path)
+def parse_xodr(file_path: str, eps: float = _SAMPLING_EPS) -> XodrMapData:
+    """Convenience function to parse an OpenDRIVE file into a map model.
+
+    Args:
+        file_path: Path to the .xodr file.
+        eps: Linearization tolerance in metres (default 0.1).
+             Use higher values (0.5–1.0) for faster loading with lower fidelity.
+    """
+    parser = XodrParser(file_path, eps=eps)
     return parser.parse()

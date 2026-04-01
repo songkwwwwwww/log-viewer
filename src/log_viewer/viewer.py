@@ -119,43 +119,69 @@ class LogViewer:
         )
         # Initialize Rerun and spawn the viewer window
         rr.init(application_id, spawn=True, default_blueprint=blueprint)
+        self._logged_static_objects: set = set()
+
+    @staticmethod
+    def _build_strip_mesh(left_pts, right_pts):
+        """Build a triangle-strip mesh from left/right boundary point lists.
+
+        Returns (vertices, indices) as numpy arrays, or (None, None) if the
+        inputs are too short or mismatched.
+        """
+        n = len(left_pts)
+        if n != len(right_pts) or n < 2:
+            return None, None
+
+        vertices = np.empty((2 * n, 3), dtype=np.float32)
+        for i in range(n):
+            lp, rp = left_pts[i], right_pts[i]
+            vertices[2 * i] = (lp.x, lp.y, lp.z)
+            vertices[2 * i + 1] = (rp.x, rp.y, rp.z)
+
+        idx = np.arange(n - 1, dtype=np.uint32)
+        l1 = 2 * idx
+        r1 = l1 + 1
+        l2 = l1 + 2
+        r2 = l1 + 3
+        tri_a = np.stack([l1, r1, l2], axis=1)
+        tri_b = np.stack([r1, r2, l2], axis=1)
+        indices = np.empty((2 * (n - 1), 3), dtype=np.uint32)
+        indices[0::2] = tri_a
+        indices[1::2] = tri_b
+
+        return vertices, indices
+
+    @staticmethod
+    def _pts_to_array(points):
+        """Convert a list of Point3D to a (N, 3) float32 numpy array."""
+        return np.array(
+            [[p.x, p.y, p.z] for p in points], dtype=np.float32
+        )
 
     def init_xodr(self, map_data: XodrMapData):
         """Initialize and log the OpenDRIVE map in the viewer.
 
         Iterates through all parsed lanes and logs them as 3D meshes (surfaces),
         line strips (boundaries and centerlines), and arrows (direction).
+        Road marks are merged into a single batched mesh for efficiency.
 
         Args:
             map_data: Parsed XODR map data containing lanes and boundaries.
         """
 
+        # ---------- Per-road batched boundaries ----------
+        # Collect boundary line strips per road to reduce rr.log() calls.
+        road_boundaries: dict = {}  # road_id -> list of (N,3) arrays
+
         for lane in map_data.lanes:
-            # Each lane is logged under a unique entity path hierarchy
             entity_path = f"map/roads/{lane.road_id}/lanes/{lane.id}"
 
             # ---------- 1. Lane surface (Mesh3D) ----------
-            # We construct a triangle strip mesh between the left and right boundaries
             left_pts = lane.left_boundary.points
             right_pts = lane.right_boundary.points
 
-            if len(left_pts) == len(right_pts) and len(left_pts) >= 2:
-                vertices = []
-                indices = []
-                for i in range(len(left_pts)):
-                    # Add vertices for both boundaries at each longitudinal step
-                    vertices.append([left_pts[i].x, left_pts[i].y, left_pts[i].z])
-                    vertices.append([right_pts[i].x, right_pts[i].y, right_pts[i].z])
-
-                    if i < len(left_pts) - 1:
-                        # Define two triangles per segment to form a quad
-                        idx_l1 = 2 * i
-                        idx_r1 = 2 * i + 1
-                        idx_l2 = 2 * i + 2
-                        idx_r2 = 2 * i + 3
-                        indices.append([idx_l1, idx_r1, idx_l2])
-                        indices.append([idx_r1, idx_r2, idx_l2])
-
+            vertices, indices = self._build_strip_mesh(left_pts, right_pts)
+            if vertices is not None:
                 color = _LANE_COLORS.get(lane.type, [100, 100, 100, 255])
                 rr.log(
                     f"{entity_path}/surface",
@@ -164,52 +190,42 @@ class LogViewer:
                         triangle_indices=indices,
                         albedo_factor=color,
                     ),
-                    # Attach lane metadata — visible in Rerun's Selection Panel
                     rr.AnyValues(
                         lane_id=lane.id,
                         road_id=lane.road_id,
                         lane_type=lane.type,
                     ),
-                    static=True,  # Map data is static across all time
+                    static=True,
                 )
 
-            # ---------- 2. Lane boundaries (LineStrips3D) ----------
-            # Log the left and right boundary lines as distinct entities
-            for boundary, name in [
-                (lane.left_boundary, "left_boundary"),
-                (lane.right_boundary, "right_boundary"),
-            ]:
-                pts = [[p.x, p.y, p.z] for p in boundary.points]
-                if pts:
-                    rr.log(
-                        f"{entity_path}/{name}",
-                        rr.LineStrips3D([pts], colors=[200, 200, 200]),
-                        static=True,
+            # ---------- 2. Lane boundaries ----------
+            # Accumulate per road for batched logging
+            road_id = lane.road_id
+            if road_id not in road_boundaries:
+                road_boundaries[road_id] = []
+            for boundary in (lane.left_boundary, lane.right_boundary):
+                if boundary.points:
+                    road_boundaries[road_id].append(
+                        self._pts_to_array(boundary.points)
                     )
 
             # ---------- 3. Center line + direction arrows ----------
-            # Log the centerline and add directional arrows for orientation
             cps = lane.center_line
             if len(cps) >= 2:
-                center_pts = [[p.x, p.y, p.z] for p in cps]
+                center_pts = self._pts_to_array(cps)
                 rr.log(
                     f"{entity_path}/center",
                     rr.LineStrips3D([center_pts], colors=[255, 255, 0]),
                     static=True,
                 )
 
-                # Left lanes travel opposite to the reference line direction
-                # (OpenDRIVE spec). Flip the computed tangent for those lanes.
                 dir_sign = -1.0 if lane.is_left else 1.0
-
-                # Place direction arrows at start, midpoint, and end of the center
-                # line. Each idx must satisfy idx+1 < len(cps) to compute a tangent.
-                last = len(cps) - 2  # last valid tangent index
+                last = len(cps) - 2
                 mid = min(len(cps) // 2, last)
                 arrow_indices = sorted(set([0, mid, last]))
                 origins = []
                 vectors = []
-                arrow_scale = 2.0  # length in world units
+                arrow_scale = 2.0
 
                 for idx in arrow_indices:
                     p0 = cps[idx]
@@ -231,67 +247,129 @@ class LogViewer:
                     rr.Arrows3D(
                         origins=origins,
                         vectors=vectors,
-                        colors=[255, 200, 0],  # Amber
+                        colors=[255, 200, 0],
                         radii=0.2,
                     ),
                     static=True,
                 )
 
-        # ---------- Road marks (Mesh3D quad strips) ----------
-        for mark_idx, mark in enumerate(map_data.road_marks):
+        # Log batched boundaries per road (one rr.log per road instead of per lane)
+        for road_id, strips in road_boundaries.items():
+            if strips:
+                rr.log(
+                    f"map/roads/{road_id}/boundaries",
+                    rr.LineStrips3D(strips, colors=[200, 200, 200]),
+                    static=True,
+                )
+
+        # ---------- Road marks: merge into a single batched mesh ----------
+        all_mark_verts = []
+        all_mark_indices = []
+        all_mark_colors = []
+        vert_offset = 0
+        for mark in map_data.road_marks:
             left_pts = mark.left_pts
             right_pts = mark.right_pts
-            if len(left_pts) != len(right_pts) or len(left_pts) < 2:
+            n = len(left_pts)
+            if n != len(right_pts) or n < 2:
                 continue
-            vertices = []
-            indices = []
-            for i in range(len(left_pts)):
-                vertices.append([left_pts[i].x, left_pts[i].y, left_pts[i].z])
-                vertices.append([right_pts[i].x, right_pts[i].y, right_pts[i].z])
-                if i < len(left_pts) - 1:
-                    idx_a1 = 2 * i
-                    idx_b1 = 2 * i + 1
-                    idx_a2 = 2 * i + 2
-                    idx_b2 = 2 * i + 3
-                    indices.append([idx_a1, idx_b1, idx_a2])
-                    indices.append([idx_b1, idx_b2, idx_a2])
+            verts = np.empty((2 * n, 3), dtype=np.float32)
+            for i in range(n):
+                lp, rp = left_pts[i], right_pts[i]
+                verts[2 * i] = (lp.x, lp.y, lp.z)
+                verts[2 * i + 1] = (rp.x, rp.y, rp.z)
+
+            idx = np.arange(n - 1, dtype=np.uint32)
+            l1 = 2 * idx + vert_offset
+            r1 = l1 + 1
+            l2 = l1 + 2
+            r2 = l1 + 3
+            tri_a = np.stack([l1, r1, l2], axis=1)
+            tri_b = np.stack([r1, r2, l2], axis=1)
+            mark_indices = np.empty((2 * (n - 1), 3), dtype=np.uint32)
+            mark_indices[0::2] = tri_a
+            mark_indices[1::2] = tri_b
+
             color = _ROAD_MARK_COLORS.get(mark.color, [255, 255, 255, 255])
+            per_vert_colors = np.tile(
+                np.array(color, dtype=np.uint8), (2 * n, 1)
+            )
+
+            all_mark_verts.append(verts)
+            all_mark_indices.append(mark_indices)
+            all_mark_colors.append(per_vert_colors)
+            vert_offset += 2 * n
+
+        if all_mark_verts:
             rr.log(
-                f"map/road_marks/{mark_idx}",
+                "map/road_marks",
                 rr.Mesh3D(
-                    vertex_positions=vertices,
-                    triangle_indices=indices,
-                    albedo_factor=color,
+                    vertex_positions=np.concatenate(all_mark_verts),
+                    triangle_indices=np.concatenate(all_mark_indices),
+                    vertex_colors=np.concatenate(all_mark_colors),
                 ),
                 static=True,
             )
 
+    def send_scalar_columns(
+        self,
+        obj_ts: dict,
+        obj_speed: dict,
+        obj_accel: dict,
+        obj_pos_x: dict,
+        obj_pos_y: dict,
+        obj_pos_z: dict,
+        obj_vel_x: dict,
+        obj_vel_y: dict,
+    ):
+        """Send all scalar timeseries as columnar batches via rr.send_columns().
+
+        This replaces per-frame rr.log() calls for scalars, reducing IPC
+        overhead from ~7*N*F calls to 7*N calls (N=objects, F=frames).
+        """
+        scalar_channels = [
+            ("speed", obj_speed),
+            ("acceleration", obj_accel),
+            ("position_x", obj_pos_x),
+            ("position_y", obj_pos_y),
+            ("position_z", obj_pos_z),
+            ("velocity_x", obj_vel_x),
+            ("velocity_y", obj_vel_y),
+        ]
+        for obj_id, ts_list in obj_ts.items():
+            ts_arr = np.array(ts_list, dtype=np.float64)
+            time_col = rr.TimeColumn("sim_time", timestamp=ts_arr)
+            for channel_name, channel_data in scalar_channels:
+                values = np.array(channel_data[obj_id], dtype=np.float64)
+                rr.send_columns(
+                    f"objects/{obj_id}/scalars/{channel_name}",
+                    indexes=[time_col],
+                    columns=rr.Scalars.columns(scalars=values),
+                )
+
     def render_state(self, frame: SceneFrame):
         """Render a single frame of simulation state.
 
-        Logs:
-          - 3D bounding boxes for all objects.
-          - Future trajectory line per object.
-          - Per-object scalar timeseries (speed, acceleration, position, velocity).
+        Logs 3D bounding boxes and future trajectories for all objects.
+        Scalar timeseries are sent separately via send_scalar_columns().
 
         Args:
             frame: The scene frame containing all object states at a given timestamp.
         """
-        # Set the current simulation time in Rerun
         rr.set_time("sim_time", timestamp=frame.timestamp)
 
         for obj_id, obj in frame.objects.items():
             obj_path = f"objects/{obj_id}"
 
-            # ---- Derived values for telemetry ----
+            # Skip re-logging static objects that have already been logged
+            if obj.is_static and obj_id in self._logged_static_objects:
+                continue
+
             speed = math.sqrt(obj.velocity.x**2 + obj.velocity.y**2 + obj.velocity.z**2)
             accel = math.sqrt(
                 obj.acceleration.x**2 + obj.acceleration.y**2 + obj.acceleration.z**2
             )
 
-            # ---- Per-object 3D bounding box + Selection metadata ----
-            # Bounding boxes represent the physical extent of the object.
-            # sub_type color takes priority; fall back to type-based color.
             color = _SUB_TYPE_COLORS.get(
                 obj.sub_type, _OBJECT_COLORS.get(obj.type, [200, 200, 200])
             )
@@ -311,7 +389,6 @@ class LogViewer:
                     colors=[color],
                     labels=[f"{obj.type}_{obj.id}"],
                 ),
-                # Visible in Selection -> Data panel when box is clicked
                 rr.AnyValues(
                     object_id=obj.id,
                     object_type=obj.type,
@@ -325,27 +402,19 @@ class LogViewer:
                     velocity_x=obj.velocity.x,
                     velocity_y=obj.velocity.y,
                 ),
+                static=obj.is_static,
             )
 
-            # ---- Scalar timeseries per object ----
-            # These are plotted in the TimeSeriesViews defined in the blueprint
-            rr.log(f"{obj_path}/scalars/speed", rr.Scalars(speed))
-            rr.log(f"{obj_path}/scalars/acceleration", rr.Scalars(accel))
-            rr.log(f"{obj_path}/scalars/position_x", rr.Scalars(obj.position.x))
-            rr.log(f"{obj_path}/scalars/position_y", rr.Scalars(obj.position.y))
-            rr.log(f"{obj_path}/scalars/position_z", rr.Scalars(obj.position.z))
-            rr.log(f"{obj_path}/scalars/velocity_x", rr.Scalars(obj.velocity.x))
-            rr.log(f"{obj_path}/scalars/velocity_y", rr.Scalars(obj.velocity.y))
+            if obj.is_static:
+                self._logged_static_objects.add(obj_id)
 
             # ---- Future trajectory ----
-            # Draws a line representing the predicted future path of the object
             if obj.future_trajectory:
                 traj_pts = [
                     [p.position.x, p.position.y, p.position.z]
                     for p in obj.future_trajectory
                 ]
                 if traj_pts:
-                    # Prepend current position to connect the line to the object
                     traj_pts.insert(0, [obj.position.x, obj.position.y, obj.position.z])
                     rr.log(
                         f"{obj_path}/trajectory",

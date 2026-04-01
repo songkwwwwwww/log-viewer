@@ -5,7 +5,11 @@ This script loads an OpenDRIVE map and a corresponding object log (JSON/JSONL)
 """
 
 import argparse
+import math
+from collections import defaultdict
 from pathlib import Path
+
+import numpy as np
 
 from .log_parser import parse_log
 from .viewer import LogViewer
@@ -38,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="log_viewer",
         help="Rerun application id used for the viewer session.",
     )
+    parser.add_argument(
+        "--sampling-eps",
+        type=float,
+        default=0.1,
+        dest="sampling_eps",
+        help=(
+            "Map linearization tolerance in metres (default: 0.1). "
+            "Higher values (0.5–1.0) load faster with lower visual fidelity."
+        ),
+    )
     return parser
 
 
@@ -61,13 +75,51 @@ def main() -> None:
         raise FileNotFoundError(f"Log file not found: {log_path}")
 
     print(f"Loading map from: {map_path}")
-    map_data = parse_xodr(str(map_path))
+    map_data = parse_xodr(str(map_path), eps=args.sampling_eps)
 
     print(f"Loading log from: {log_path}")
     frames = parse_log(str(log_path))
 
     viewer = LogViewer(application_id=args.application_id)
     viewer.init_xodr(map_data)
+
+    # Pre-compute scalar timeseries per object and send as columnar batches.
+    # This replaces per-frame rr.log() calls for 7 scalar channels,
+    # reducing IPC overhead from ~7*N*F calls to 7*N calls.
+    print("Pre-computing scalar timeseries...")
+    obj_ts: dict = defaultdict(list)       # obj_id -> [timestamp, ...]
+    obj_speed: dict = defaultdict(list)
+    obj_accel: dict = defaultdict(list)
+    obj_pos_x: dict = defaultdict(list)
+    obj_pos_y: dict = defaultdict(list)
+    obj_pos_z: dict = defaultdict(list)
+    obj_vel_x: dict = defaultdict(list)
+    obj_vel_y: dict = defaultdict(list)
+
+    for frame in frames:
+        for obj_id, obj in frame.objects.items():
+            obj_ts[obj_id].append(frame.timestamp)
+            speed = math.sqrt(
+                obj.velocity.x ** 2 + obj.velocity.y ** 2 + obj.velocity.z ** 2
+            )
+            accel = math.sqrt(
+                obj.acceleration.x ** 2
+                + obj.acceleration.y ** 2
+                + obj.acceleration.z ** 2
+            )
+            obj_speed[obj_id].append(speed)
+            obj_accel[obj_id].append(accel)
+            obj_pos_x[obj_id].append(obj.position.x)
+            obj_pos_y[obj_id].append(obj.position.y)
+            obj_pos_z[obj_id].append(obj.position.z)
+            obj_vel_x[obj_id].append(obj.velocity.x)
+            obj_vel_y[obj_id].append(obj.velocity.y)
+
+    viewer.send_scalar_columns(
+        obj_ts, obj_speed, obj_accel,
+        obj_pos_x, obj_pos_y, obj_pos_z,
+        obj_vel_x, obj_vel_y,
+    )
 
     print(f"Sending {len(frames)} frames to Rerun...")
     for frame in frames:
