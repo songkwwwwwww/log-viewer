@@ -161,106 +161,117 @@ class LogViewer:
     def init_xodr(self, map_data: XodrMapData):
         """Initialize and log the OpenDRIVE map in the viewer.
 
-        Iterates through all parsed lanes and logs them as 3D meshes (surfaces),
-        line strips (boundaries and centerlines), and arrows (direction).
-        Road marks are merged into a single batched mesh for efficiency.
+        All map geometry is batched into a small number of global Rerun entities
+        to minimise the entity tree size and rr.log() call count:
+          - Lane surfaces: one Mesh3D per lane type (4 entities)
+          - Lane boundaries: single LineStrips3D (1 entity)
+          - Center lines: single LineStrips3D (1 entity)
+          - Direction arrows: single Arrows3D (1 entity)
+          - Road marks: single Mesh3D (1 entity, unchanged)
 
         Args:
             map_data: Parsed XODR map data containing lanes and boundaries.
         """
 
-        # ---------- Per-road batched boundaries ----------
-        # Collect boundary line strips per road to reduce rr.log() calls.
-        road_boundaries: dict = {}  # road_id -> list of (N,3) arrays
+        # ---------- Accumulators for batched geometry ----------
+        # Lane surfaces grouped by type: type -> (verts_list, indices_list, offset)
+        surf_verts: dict = {t: [] for t in _LANE_COLORS}
+        surf_indices: dict = {t: [] for t in _LANE_COLORS}
+        surf_vert_offset: dict = {t: 0 for t in _LANE_COLORS}
+
+        all_boundary_strips = []   # all boundary LineStrips3D strips
+        all_center_strips = []     # all center line strips
+        all_arrow_origins = []     # direction arrow origins
+        all_arrow_vectors = []     # direction arrow vectors
+
+        arrow_scale = 2.0
 
         for lane in map_data.lanes:
-            entity_path = f"map/roads/{lane.road_id}/lanes/{lane.id}"
-
-            # ---------- 1. Lane surface (Mesh3D) ----------
             left_pts = lane.left_boundary.points
             right_pts = lane.right_boundary.points
 
+            # ---------- 1. Lane surface: accumulate per lane type ----------
             vertices, indices = self._build_strip_mesh(left_pts, right_pts)
-            if vertices is not None:
-                color = _LANE_COLORS.get(lane.type, [100, 100, 100, 255])
-                rr.log(
-                    f"{entity_path}/surface",
-                    rr.Mesh3D(
-                        vertex_positions=vertices,
-                        triangle_indices=indices,
-                        albedo_factor=color,
-                    ),
-                    rr.AnyValues(
-                        lane_id=lane.id,
-                        road_id=lane.road_id,
-                        lane_type=lane.type,
-                    ),
-                    static=True,
-                )
+            if vertices is not None and lane.type in surf_verts:
+                offset = surf_vert_offset[lane.type]
+                surf_verts[lane.type].append(vertices)
+                surf_indices[lane.type].append(indices + offset)
+                surf_vert_offset[lane.type] += len(vertices)
 
-            # ---------- 2. Lane boundaries ----------
-            # Accumulate per road for batched logging
-            road_id = lane.road_id
-            if road_id not in road_boundaries:
-                road_boundaries[road_id] = []
+            # ---------- 2. Lane boundaries: accumulate all strips ----------
             for boundary in (lane.left_boundary, lane.right_boundary):
                 if boundary.points:
-                    road_boundaries[road_id].append(
-                        self._pts_to_array(boundary.points)
-                    )
+                    all_boundary_strips.append(self._pts_to_array(boundary.points))
 
-            # ---------- 3. Center line + direction arrows ----------
+            # ---------- 3. Center lines + direction arrows ----------
             cps = lane.center_line
             if len(cps) >= 2:
-                center_pts = self._pts_to_array(cps)
-                rr.log(
-                    f"{entity_path}/center",
-                    rr.LineStrips3D([center_pts], colors=[255, 255, 0]),
-                    static=True,
-                )
+                all_center_strips.append(self._pts_to_array(cps))
 
                 dir_sign = -1.0 if lane.is_left else 1.0
                 last = len(cps) - 2
                 mid = min(len(cps) // 2, last)
-                arrow_indices = sorted(set([0, mid, last]))
-                origins = []
-                vectors = []
-                arrow_scale = 2.0
-
-                for idx in arrow_indices:
+                for idx in sorted(set([0, mid, last])):
                     p0 = cps[idx]
                     p1 = cps[idx + 1]
                     dx = p1.x - p0.x
                     dy = p1.y - p0.y
                     norm = math.sqrt(dx * dx + dy * dy) or 1.0
-                    origins.append([p0.x, p0.y, p0.z + 0.3])
-                    vectors.append(
-                        [
-                            dx / norm * arrow_scale * dir_sign,
-                            dy / norm * arrow_scale * dir_sign,
-                            0.0,
-                        ]
-                    )
+                    all_arrow_origins.append([p0.x, p0.y, p0.z + 0.3])
+                    all_arrow_vectors.append([
+                        dx / norm * arrow_scale * dir_sign,
+                        dy / norm * arrow_scale * dir_sign,
+                        0.0,
+                    ])
 
-                rr.log(
-                    f"{entity_path}/direction",
-                    rr.Arrows3D(
-                        origins=origins,
-                        vectors=vectors,
-                        colors=[255, 200, 0],
-                        radii=0.2,
-                    ),
-                    static=True,
-                )
+        # ---------- Flush batched lane surfaces (one rr.log per lane type) ----------
+        for lane_type, verts_list in surf_verts.items():
+            if not verts_list:
+                continue
+            combined_verts = np.concatenate(verts_list)
+            combined_indices = np.concatenate(surf_indices[lane_type])
+            color = _LANE_COLORS[lane_type]
+            per_vert_colors = np.tile(
+                np.array(color, dtype=np.uint8), (len(combined_verts), 1)
+            )
+            rr.log(
+                f"map/surfaces/{lane_type}",
+                rr.Mesh3D(
+                    vertex_positions=combined_verts,
+                    triangle_indices=combined_indices,
+                    vertex_colors=per_vert_colors,
+                ),
+                static=True,
+            )
 
-        # Log batched boundaries per road (one rr.log per road instead of per lane)
-        for road_id, strips in road_boundaries.items():
-            if strips:
-                rr.log(
-                    f"map/roads/{road_id}/boundaries",
-                    rr.LineStrips3D(strips, colors=[200, 200, 200]),
-                    static=True,
-                )
+        # ---------- Flush boundaries (single rr.log) ----------
+        if all_boundary_strips:
+            rr.log(
+                "map/boundaries",
+                rr.LineStrips3D(all_boundary_strips, colors=[200, 200, 200]),
+                static=True,
+            )
+
+        # ---------- Flush center lines (single rr.log) ----------
+        if all_center_strips:
+            rr.log(
+                "map/centers",
+                rr.LineStrips3D(all_center_strips, colors=[255, 255, 0]),
+                static=True,
+            )
+
+        # ---------- Flush direction arrows (single rr.log) ----------
+        if all_arrow_origins:
+            rr.log(
+                "map/directions",
+                rr.Arrows3D(
+                    origins=all_arrow_origins,
+                    vectors=all_arrow_vectors,
+                    colors=[255, 200, 0],
+                    radii=0.2,
+                ),
+                static=True,
+            )
 
         # ---------- Road marks: merge into a single batched mesh ----------
         all_mark_verts = []

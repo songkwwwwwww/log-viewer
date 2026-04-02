@@ -20,6 +20,8 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from scipy.special import fresnel as _scipy_fresnel
 
 from .geometry import Point3D
@@ -197,16 +199,6 @@ def _normalize_3d(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
         return (0.0, 0.0, 1.0)
     return (v[0] / n, v[1] / n, v[2] / n)
 
-
-def _cross_product(
-    a: Tuple[float, float, float], b: Tuple[float, float, float]
-) -> Tuple[float, float, float]:
-    """Computes the cross product of two 3D vectors."""
-    return (
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    )
 
 
 def _cubic_bezier_1d_get_control_points(
@@ -434,15 +426,26 @@ class _CubicProfile:
 
     def __init__(self, segments: Optional[Dict[float, _CubicPoly]] = None):
         self.segments = dict(sorted((segments or {}).items()))
+        self._cached_keys: tuple = tuple(self.segments)
+        # Numpy arrays for vectorised evaluate_array() — built once at construction.
+        if self.segments:
+            self._keys_np = np.array(self._cached_keys, dtype=np.float64)
+            self._coeffs_np = np.array(
+                [[p.a, p.b, p.c, p.d] for p in self.segments.values()],
+                dtype=np.float64,
+            )
+        else:
+            self._keys_np = np.empty(0, dtype=np.float64)
+            self._coeffs_np = np.empty((0, 4), dtype=np.float64)
 
-    def _keys(self) -> List[float]:
-        return list(self.segments.keys())
+    def _keys(self) -> tuple:
+        return self._cached_keys
 
     def get_poly(self, s: float, extend_start: bool = True) -> Optional[_CubicPoly]:
         if not self.segments:
             return None
 
-        keys = self._keys()
+        keys = self._cached_keys
         if not extend_start and s < keys[0]:
             return None
 
@@ -458,6 +461,22 @@ class _CubicProfile:
         if poly is None:
             return default_val
         return poly.evaluate(s)
+
+    def evaluate_array(self, s_arr: np.ndarray) -> np.ndarray:
+        """Evaluate the profile at an array of s-values using vectorised numpy ops.
+
+        Significantly faster than calling evaluate() in a Python loop when
+        len(s_arr) is large (typical lane has 50–300 sample points).
+        """
+        if not self.segments:
+            return np.zeros(len(s_arr), dtype=np.float64)
+        idx = np.searchsorted(self._keys_np, s_arr, side="right") - 1
+        idx = np.clip(idx, 0, len(self._cached_keys) - 1)
+        a = self._coeffs_np[idx, 0]
+        b = self._coeffs_np[idx, 1]
+        c = self._coeffs_np[idx, 2]
+        d = self._coeffs_np[idx, 3]
+        return a + b * s_arr + c * s_arr ** 2 + d * s_arr ** 3
 
     def derivative(
         self, s: float, default_val: float = 0.0, extend_start: bool = True
@@ -500,7 +519,7 @@ class _CubicProfile:
         if s_start == s_end or not self.segments:
             return 0.0
 
-        keys = self._keys()
+        keys = self._cached_keys
         end_idx = bisect_left(keys, s_end)
         start_idx = bisect_right(keys, s_start) - 1
         if start_idx < 0:
@@ -522,7 +541,7 @@ class _CubicProfile:
         if s_start == s_end or not self.segments:
             return []
 
-        keys = self._keys()
+        keys = self._cached_keys
         end_idx = bisect_left(keys, s_end)
         start_idx = bisect_right(keys, s_start) - 1
         if start_idx < 0:
@@ -910,106 +929,128 @@ class _RoadGeometryCache:
         elevation_profile: Optional["ElevationProfile"],
         sample_s_values: Optional[List[float]],
     ) -> List[Tuple["Point3D", float, Tuple[float, float]]]:
-        """Core evaluation logic, mirrors the original _parse_plan_view."""
-        pts: List[Tuple[Point3D, float, Tuple[float, float]]] = []
+        """Core evaluation logic, mirrors the original _parse_plan_view.
 
-        def _z(s: float) -> float:
-            return elevation_profile.get_z(s) if elevation_profile else 0.0
+        Uses vectorised numpy operations for line/arc/spiral segments; falls back
+        to a scalar loop only for paramPoly3 (which has a LUT-based evaluation).
+        """
+        pts: List[Tuple[Point3D, float, Tuple[float, float]]] = []
 
         for seg in self.segments:
             skip_first = len(pts) > 0
 
-            # Build s-value sample set
+            # ---- Build sorted s-value array for this segment ----
             if sample_s_values is not None:
-                s_set = {s for s in sample_s_values if seg.s_start <= s <= seg.s_end}
-                if not s_set:
+                s_filtered = [s for s in sample_s_values
+                               if seg.s_start <= s <= seg.s_end]
+                if not s_filtered:
                     continue
+                s_arr = np.array(sorted(set(s_filtered)), dtype=np.float64)
             else:
                 s_set: set = {seg.s_start, seg.s_end}
                 if elevation_profile:
                     s_set.update(
                         elevation_profile.get_sample_s_values(seg.s_start, seg.s_end, eps)
                     )
-                if seg.kind == "line":
-                    pass  # endpoints only
-                elif seg.kind == "arc":
-                    if abs(seg.curvature) > 1e-12:
-                        s_step = 0.01 / abs(seg.curvature)
-                        s = seg.s_start
-                        while s < seg.s_end:
-                            s_set.add(s)
-                            s += s_step
+                if seg.kind == "arc" and abs(seg.curvature) > 1e-12:
+                    s_step = 0.01 / abs(seg.curvature)
+                    s_set.update(np.arange(seg.s_start, seg.s_end, s_step).tolist())
                 elif seg.kind == "spiral":
-                    s_step = 10.0 * eps
-                    s = seg.s_start
-                    while s < seg.s_end:
-                        s_set.add(s)
-                        s += s_step
+                    s_set.update(np.arange(seg.s_start, seg.s_end, 10.0 * eps).tolist())
                 elif seg.kind == "paramPoly3":
-                    s_step = eps
-                    s = seg.s_start
-                    while s < seg.s_end:
-                        s_set.add(s)
-                        s += s_step
+                    s_set.update(np.arange(seg.s_start, seg.s_end, eps).tolist())
+                s_arr = np.array(sorted(s_set), dtype=np.float64)
 
-            # Evaluate at each s-value
-            if seg.kind == "spiral":
-                for s_curr in sorted(s_set):
-                    if skip_first and abs(s_curr - seg.s_start) < 1e-9:
-                        continue
-                    if abs(seg.c_dot) <= 1e-12:
-                        ds = s_curr - seg.s_start
-                        x = seg.x0 + ds * math.cos(seg.hdg)
-                        y = seg.y0 + ds * math.sin(seg.hdg)
-                        dx, dy = math.cos(seg.hdg), math.sin(seg.hdg)
-                    else:
-                        xs_sp, ys_sp, as_sp = _odr_spiral(
-                            s_curr - seg.s_start + seg.s0_spiral, seg.c_dot
-                        )
-                        x = (
-                            math.cos(seg.hdg_offset) * (xs_sp - seg.x0_spiral)
-                            - math.sin(seg.hdg_offset) * (ys_sp - seg.y0_spiral)
-                            + seg.x0
-                        )
-                        y = (
-                            math.sin(seg.hdg_offset) * (xs_sp - seg.x0_spiral)
-                            + math.cos(seg.hdg_offset) * (ys_sp - seg.y0_spiral)
-                            + seg.y0
-                        )
-                        tang_angle = as_sp + seg.hdg_offset
-                        dx, dy = math.cos(tang_angle), math.sin(tang_angle)
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
+            # Drop the duplicate start point when joining segments
+            if skip_first and len(s_arr) > 0 and abs(s_arr[0] - seg.s_start) < 1e-9:
+                s_arr = s_arr[1:]
+            if len(s_arr) == 0:
+                continue
+
+            ds_arr = s_arr - seg.s_start
+
+            # ---- Vectorised geometry evaluation per segment kind ----
+            if seg.kind == "line":
+                cos_h = math.cos(seg.hdg)
+                sin_h = math.sin(seg.hdg)
+                x_arr = seg.x0 + ds_arr * cos_h
+                y_arr = seg.y0 + ds_arr * sin_h
+                dx_arr = np.full(len(s_arr), cos_h)
+                dy_arr = np.full(len(s_arr), sin_h)
+
+            elif seg.kind == "arc":
+                if abs(seg.curvature) < 1e-12:
+                    cos_h = math.cos(seg.hdg)
+                    sin_h = math.sin(seg.hdg)
+                    x_arr = seg.x0 + ds_arr * cos_h
+                    y_arr = seg.y0 + ds_arr * sin_h
+                    dx_arr = np.full(len(s_arr), cos_h)
+                    dy_arr = np.full(len(s_arr), sin_h)
+                else:
+                    radius = 1.0 / seg.curvature
+                    cx = seg.x0 - radius * math.sin(seg.hdg)
+                    cy = seg.y0 + radius * math.cos(seg.hdg)
+                    theta = seg.hdg - math.pi / 2 + ds_arr * seg.curvature
+                    x_arr = cx + radius * np.cos(theta)
+                    y_arr = cy + radius * np.sin(theta)
+                    ang = math.pi / 2 - seg.curvature * ds_arr - seg.hdg
+                    dx_arr = np.sin(ang)
+                    dy_arr = np.cos(ang)
+
+            elif seg.kind == "spiral":
+                if abs(seg.c_dot) <= 1e-12:
+                    cos_h = math.cos(seg.hdg)
+                    sin_h = math.sin(seg.hdg)
+                    x_arr = seg.x0 + ds_arr * cos_h
+                    y_arr = seg.y0 + ds_arr * sin_h
+                    dx_arr = np.full(len(s_arr), cos_h)
+                    dy_arr = np.full(len(s_arr), sin_h)
+                else:
+                    a = math.sqrt(math.pi / abs(seg.c_dot))
+                    spiral_s = ds_arr + seg.s0_spiral
+                    S, C = _scipy_fresnel(spiral_s / a)
+                    xs_sp = C * a
+                    ys_sp = S * a if seg.c_dot >= 0 else -S * a
+                    tang_s = spiral_s ** 2 * seg.c_dot * 0.5
+                    cos_off = math.cos(seg.hdg_offset)
+                    sin_off = math.sin(seg.hdg_offset)
+                    x_arr = (cos_off * (xs_sp - seg.x0_spiral)
+                             - sin_off * (ys_sp - seg.y0_spiral) + seg.x0)
+                    y_arr = (sin_off * (xs_sp - seg.x0_spiral)
+                             + cos_off * (ys_sp - seg.y0_spiral) + seg.y0)
+                    tang_angle = tang_s + seg.hdg_offset
+                    dx_arr = np.cos(tang_angle)
+                    dy_arr = np.sin(tang_angle)
+
+            elif seg.kind == "paramPoly3":
+                # paramPoly3 uses a LUT-based arc-length inversion; keep scalar loop.
+                x_list, y_list, dx_list, dy_list = [], [], [], []
+                for ds in ds_arr:
+                    xv, yv = seg.pp3.get_xy(float(ds), seg.x0, seg.y0, seg.hdg)
+                    dxv, dyv = seg.pp3.get_tangent(float(ds), seg.hdg)
+                    x_list.append(xv); y_list.append(yv)
+                    dx_list.append(dxv); dy_list.append(dyv)
+                x_arr = np.array(x_list)
+                y_arr = np.array(y_list)
+                dx_arr = np.array(dx_list)
+                dy_arr = np.array(dy_list)
+
             else:
-                for s_curr in sorted(s_set):
-                    if skip_first and abs(s_curr - seg.s_start) < 1e-9:
-                        continue
-                    ds = s_curr - seg.s_start
+                continue
 
-                    if seg.kind == "line":
-                        x = seg.x0 + ds * math.cos(seg.hdg)
-                        y = seg.y0 + ds * math.sin(seg.hdg)
-                        dx, dy = math.cos(seg.hdg), math.sin(seg.hdg)
-                    elif seg.kind == "arc":
-                        if abs(seg.curvature) < 1e-12:
-                            x = seg.x0 + ds * math.cos(seg.hdg)
-                            y = seg.y0 + ds * math.sin(seg.hdg)
-                            dx, dy = math.cos(seg.hdg), math.sin(seg.hdg)
-                        else:
-                            radius = 1.0 / seg.curvature
-                            cx = seg.x0 - radius * math.sin(seg.hdg)
-                            cy = seg.y0 + radius * math.cos(seg.hdg)
-                            theta = seg.hdg - math.pi / 2 + ds * seg.curvature
-                            x = cx + radius * math.cos(theta)
-                            y = cy + radius * math.sin(theta)
-                            dx = math.sin(math.pi / 2 - seg.curvature * ds - seg.hdg)
-                            dy = math.cos(math.pi / 2 - seg.curvature * ds - seg.hdg)
-                    elif seg.kind == "paramPoly3":
-                        x, y = seg.pp3.get_xy(ds, seg.x0, seg.y0, seg.hdg)
-                        dx, dy = seg.pp3.get_tangent(ds, seg.hdg)
-                    else:
-                        continue
+            # ---- Elevation z-values (batched) ----
+            if elevation_profile is not None:
+                z_arr = elevation_profile._profile.evaluate_array(s_arr)
+            else:
+                z_arr = np.zeros(len(s_arr))
 
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
+            # ---- Append results ----
+            for i in range(len(s_arr)):
+                pts.append((
+                    Point3D(float(x_arr[i]), float(y_arr[i]), float(z_arr[i])),
+                    float(s_arr[i]),
+                    (float(dx_arr[i]), float(dy_arr[i])),
+                ))
 
         return pts
 
@@ -1041,17 +1082,15 @@ class XodrParser:
         road_links = []
         road_marks_to_render = []
 
-        # First pass: build geometry caches and collect reference line endpoints
+        # First pass: build geometry caches only (no geometry evaluation here).
+        # Reference line endpoints are collected in the second pass where elevation
+        # profiles are available, avoiding a redundant double evaluation per road.
         road_geom_caches: Dict[str, _RoadGeometryCache] = {}
-        road_ref_endpoints: dict = {}
         for road in self.root.findall("road"):
             road_id = road.get("id", "unknown")
-            cache = _RoadGeometryCache(road)
-            road_geom_caches[road_id] = cache
-            pts_with_s = cache.get_default_s_set(self._eps)
-            if pts_with_s:
-                road_ref_endpoints[road_id] = (pts_with_s[0][0], pts_with_s[-1][0])
+            road_geom_caches[road_id] = _RoadGeometryCache(road)
 
+        road_ref_endpoints: dict = {}
         for road in self.root.findall("road"):
             road_id = road.get("id", "unknown")
             geom_cache = road_geom_caches[road_id]
@@ -1066,6 +1105,9 @@ class XodrParser:
             )
             if not ref_line_with_s:
                 continue
+
+            # Collect endpoints for road link resolution (previously done in pass 1)
+            road_ref_endpoints[road_id] = (ref_line_with_s[0][0], ref_line_with_s[-1][0])
 
             # 3. Parse road connectivity (successor links)
             link_tag = road.find("link")
@@ -1181,15 +1223,16 @@ class XodrParser:
                         ref_pts = [pt for pt, _, _ in section_pts_with_s]
                         tangents = [dxy for _, _, dxy in section_pts_with_s]
                         s_vals = [s for _, s, _ in section_pts_with_s]
-                        inner_offsets = [inner_border.evaluate(s) for s in s_vals]
-                        outer_offsets = [outer_border.evaluate(s) for s in s_vals]
+                        s_arr = np.array(s_vals, dtype=np.float64)
+                        inner_offsets = inner_border.evaluate_array(s_arr)
+                        outer_offsets = outer_border.evaluate_array(s_arr)
                         parsed_lane = self._process_lane(
                             lane_tag,
                             road_id,
                             ref_pts,
                             inner_offsets,
                             outer_offsets,
-                            s_vals,
+                            s_arr,
                             tangents,
                             is_left=True,
                             elevation_profile=elevation_profile,
@@ -1252,15 +1295,16 @@ class XodrParser:
                         ref_pts = [pt for pt, _, _ in section_pts_with_s]
                         tangents = [dxy for _, _, dxy in section_pts_with_s]
                         s_vals = [s for _, s, _ in section_pts_with_s]
-                        inner_offsets = [inner_border.evaluate(s) for s in s_vals]
-                        outer_offsets = [outer_border.evaluate(s) for s in s_vals]
+                        s_arr = np.array(s_vals, dtype=np.float64)
+                        inner_offsets = inner_border.evaluate_array(s_arr)
+                        outer_offsets = outer_border.evaluate_array(s_arr)
                         parsed_lane = self._process_lane(
                             lane_tag,
                             road_id,
                             ref_pts,
                             inner_offsets,
                             outer_offsets,
-                            s_vals,
+                            s_arr,
                             tangents,
                             is_left=False,
                             elevation_profile=elevation_profile,
@@ -1624,219 +1668,14 @@ class XodrParser:
                     )
         return SuperelevationProfile(superelev_entries), CrossfallProfile(crossfall_entries)
 
-    def _parse_plan_view(
-        self,
-        road: ET.Element,
-        eps: float = 0.1,
-        elevation_profile: Optional[ElevationProfile] = None,
-        sample_s_values: Optional[List[float]] = None,
-    ) -> List[Tuple[Point3D, float, Tuple[float, float]]]:
-        """Parse the reference line geometries into a list of (Point3D, s, (dx, dy)) triples.
-
-        Each entry contains:
-        - Point3D: world position (x, y, z)
-        - s: arc-length coordinate along the reference line
-        - (dx, dy): analytic 2D tangent direction (unit vector in the XY plane).
-
-        Using analytic derivatives instead of finite differences mirrors
-        RefLine::derivative() in libOpenDRIVE/src/RefLine.cpp, which calls each
-        geometry's derivative() method (Arc::derivative, Spiral::derivative, etc.)
-        rather than approximating from sampled points.
-
-        Geometry types and their tangent formulas:
-        - Line:       [cos(hdg), sin(hdg)]  (constant)
-        - Arc:        [sin(π/2 - κ(s-s0) - hdg), cos(π/2 - κ(s-s0) - hdg)]
-        - Spiral:     derived from odrSpiral tangent angle t = s²·c_dot/2
-        - ParamPoly3: derivative of (u(p), v(p)) rotated by hdg, normalised
-
-        Uses adaptive sampling per geometry type, mirroring libOpenDRIVE:
-        - Line: endpoints only (already linear).
-        - Arc: ~1-degree intervals based on curvature (0.01/|curvature|).
-        - Spiral: uniform steps of 10*eps.
-        - ParamPoly3: uniform steps of eps.
-        Elevation profile change-points are merged into every segment's sample set.
-        """
-        plan_view = road.find("planView")
-        if plan_view is None:
-            return []
-
-        pts: List[Tuple[Point3D, float, Tuple[float, float]]] = []
-        for geom in plan_view.findall("geometry"):
-            s_start = float(geom.get("s", 0))
-            x0 = float(geom.get("x", 0))
-            y0 = float(geom.get("y", 0))
-            hdg = float(geom.get("hdg", 0))
-            length = float(geom.get("length", 0))
-            s_end = s_start + length
-
-            def _z(s: float) -> float:
-                return elevation_profile.get_z(s) if elevation_profile else 0.0
-
-            # Skip duplicate start point if this isn't the first segment of the road
-            skip_first = len(pts) > 0
-
-            # Build the sorted set of s-values to sample for this geometry segment.
-            # When explicit sample values are provided, evaluate the geometry exactly
-            # at those positions instead of interpolating later.
-            if sample_s_values is not None:
-                s_set = {
-                    s for s in sample_s_values if s_start <= s <= s_end
-                }
-                if not s_set:
-                    continue
-            else:
-                s_set: set = {s_start, s_end}
-                if elevation_profile:
-                    s_set.update(
-                        elevation_profile.get_sample_s_values(s_start, s_end, eps)
-                    )
-
-                # ---------- Line Geometry ----------
-                if geom.find("line") is not None:
-                    # Lines are already linear — endpoints only (libOpenDRIVE Line::approximate_linear)
-                    pass  # s_set already has s_start and s_end
-
-                # ---------- Arc Geometry (Constant Curvature) ----------
-                elif geom.find("arc") is not None:
-                    arc_elem = geom.find("arc")
-                    curvature = float(arc_elem.get("curvature", 0))
-                    if abs(curvature) > 1e-12:
-                        # ~1-degree steps: s_step = 0.01 / |curvature|
-                        s_step = 0.01 / abs(curvature)
-                        s = s_start
-                        while s < s_end:
-                            s_set.add(s)
-                            s += s_step
-
-                # ---------- Spiral Geometry (Clothoid / Euler Spiral) ----------
-                elif geom.find("spiral") is not None:
-                    s_step = 10.0 * eps
-                    s = s_start
-                    while s < s_end:
-                        s_set.add(s)
-                        s += s_step
-
-                # ---------- Parametric Cubic Polynomial Geometry ----------
-                elif geom.find("paramPoly3") is not None:
-                    s_step = eps
-                    s = s_start
-                    while s < s_end:
-                        s_set.add(s)
-                        s += s_step
-
-            # Evaluate geometry at each sample s-value in sorted order.
-            # For arc and paramPoly3 we need the element attributes; re-fetch here.
-            arc_elem = geom.find("arc")
-            pp3_elem = geom.find("paramPoly3")
-            spiral_elem = geom.find("spiral")
-
-            if arc_elem is not None:
-                curvature = float(arc_elem.get("curvature", 0))
-            if spiral_elem is not None:
-                curv_start_sp = float(spiral_elem.get("curvStart", 0))
-                curv_end_sp = float(spiral_elem.get("curvEnd", 0))
-                c_dot_sp = (
-                    (curv_end_sp - curv_start_sp) / length if length > 0 else 0.0
-                )
-                # s-offset in the standard spiral (starting at curv=0) that
-                # corresponds to the start of this geometry segment.
-                # Mirrors Spiral::Spiral() in libOpenDRIVE: s0_spiral = curv_start / c_dot
-                s0_spiral_sp = curv_start_sp / c_dot_sp if abs(c_dot_sp) > 1e-12 else 0.0
-                x0_spiral_sp, y0_spiral_sp, a0_spiral_sp = (
-                    _odr_spiral(s0_spiral_sp, c_dot_sp)
-                    if abs(c_dot_sp) > 1e-12
-                    else (0.0, 0.0, 0.0)
-                )
-            if pp3_elem is not None:
-                pp3 = _ParamPoly3(
-                    aU=float(pp3_elem.get("aU", 0)),
-                    bU=float(pp3_elem.get("bU", 0)),
-                    cU=float(pp3_elem.get("cU", 0)),
-                    dU=float(pp3_elem.get("dU", 0)),
-                    aV=float(pp3_elem.get("aV", 0)),
-                    bV=float(pp3_elem.get("bV", 0)),
-                    cV=float(pp3_elem.get("cV", 0)),
-                    dV=float(pp3_elem.get("dV", 0)),
-                    length=length,
-                    p_range=pp3_elem.get("pRange", "normalized"),
-                )
-
-            # For spiral: compute each point independently via Fresnel integrals.
-            # Mirrors Spiral::get_xy() and Spiral::derivative() in libOpenDRIVE.
-            if spiral_elem is not None:
-                hdg_offset = hdg - a0_spiral_sp
-                for s_curr in sorted(s_set):
-                    if skip_first and abs(s_curr - s_start) < 1e-9:
-                        continue
-                    if abs(c_dot_sp) <= 1e-12:
-                        # Degenerate spiral: straight line tangent
-                        ds = s_curr - s_start
-                        x = x0 + ds * math.cos(hdg)
-                        y = y0 + ds * math.sin(hdg)
-                        dx, dy = math.cos(hdg), math.sin(hdg)
-                    else:
-                        xs_sp, ys_sp, as_sp = _odr_spiral(
-                            s_curr - s_start + s0_spiral_sp, c_dot_sp
-                        )
-                        x = (
-                            math.cos(hdg_offset) * (xs_sp - x0_spiral_sp)
-                            - math.sin(hdg_offset) * (ys_sp - y0_spiral_sp)
-                            + x0
-                        )
-                        y = (
-                            math.sin(hdg_offset) * (xs_sp - x0_spiral_sp)
-                            + math.cos(hdg_offset) * (ys_sp - y0_spiral_sp)
-                            + y0
-                        )
-                        # Tangent angle in global frame = as_sp + hdg - a0_spiral_sp
-                        # Mirrors Spiral::derivative() in libOpenDRIVE.
-                        tang_angle = as_sp + hdg_offset
-                        dx, dy = math.cos(tang_angle), math.sin(tang_angle)
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
-            else:
-                for s_curr in sorted(s_set):
-                    if skip_first and abs(s_curr - s_start) < 1e-9:
-                        continue
-                    ds = s_curr - s_start
-
-                    if geom.find("line") is not None:
-                        x = x0 + ds * math.cos(hdg)
-                        y = y0 + ds * math.sin(hdg)
-                        # Tangent is constant for a line segment.
-                        dx, dy = math.cos(hdg), math.sin(hdg)
-                    elif arc_elem is not None:
-                        if abs(curvature) < 1e-12:
-                            x = x0 + ds * math.cos(hdg)
-                            y = y0 + ds * math.sin(hdg)
-                            dx, dy = math.cos(hdg), math.sin(hdg)
-                        else:
-                            radius = 1.0 / curvature
-                            cx = x0 - radius * math.sin(hdg)
-                            cy = y0 + radius * math.cos(hdg)
-                            theta = hdg - math.pi / 2 + ds * curvature
-                            x = cx + radius * math.cos(theta)
-                            y = cy + radius * math.sin(theta)
-                            # Mirrors Arc::derivative() in libOpenDRIVE.
-                            dx = math.sin(math.pi / 2 - curvature * ds - hdg)
-                            dy = math.cos(math.pi / 2 - curvature * ds - hdg)
-                    elif pp3_elem is not None:
-                        x, y = pp3.get_xy(ds, x0, y0, hdg)
-                        dx, dy = pp3.get_tangent(ds, hdg)
-                    else:
-                        continue
-
-                    pts.append((Point3D(x, y, _z(s_curr)), s_curr, (dx, dy)))
-
-        return pts
-
     def _process_lane(
         self,
         lane_tag: ET.Element,
         road_id: str,
         ref_line: List[Point3D],
-        inner_offsets: List[float],
-        outer_offsets: List[float],
-        s_vals: List[float],
+        inner_offsets: np.ndarray,
+        outer_offsets: np.ndarray,
+        s_vals: np.ndarray,
         tangents: List[Tuple[float, float]],
         is_left: bool,
         elevation_profile: Optional[ElevationProfile],
@@ -1846,9 +1685,8 @@ class XodrParser:
     ) -> Optional[Lane]:
         """Constructs a 3D Lane object from road geometry and lateral profiles.
 
-        This function calculates the exact 3D position of lane boundaries and 
-        centerlines by applying lateral offsets (t), superelevation (roll), 
-        and crossfall to the road's reference line.
+        Uses vectorised numpy operations to compute lane boundary points in bulk
+        instead of a per-point Python loop.
 
         Coordinate System:
           - e_s: Unit tangent vector (longitudinal direction).
@@ -1867,65 +1705,83 @@ class XodrParser:
         # Road::get_surface_pt() in libOpenDRIVE/src/Road.cpp (lines 178-183).
         lane_level = lane_tag.get("level", "false").lower() == "true"
 
-        center_pts = []
-        inner_pts = []
-        outer_pts = []
-
         n = len(ref_line)
-        for i in range(n):
-            s = s_vals[i]
-            px, py, pz = ref_line[i].x, ref_line[i].y, ref_line[i].z
 
-            # 1. Compute local orthonormal frame (e_s, e_t, e_h)
-            # Use the analytic tangent stored alongside each reference-line point.
-            dx2d, dy2d = tangents[i]
-            dz = elevation_profile.get_dz(s) if elevation_profile else 0.0
-            e_s = _normalize_3d((dx2d, dy2d, dz))
-            theta = superelevation_profile.get_value(s)
-            e_t = _compute_e_t(e_s, theta)
-            e_h = _normalize_3d(_cross_product(e_s, e_t))
+        # --- Build (N, 3) reference-line position array ---
+        ref_pts = np.empty((n, 3), dtype=np.float64)
+        for i, pt in enumerate(ref_line):
+            ref_pts[i] = (pt.x, pt.y, pt.z)
 
-            # 2. Determine lateral offsets for inner, outer, and center paths
-            io = inner_offsets[i]
-            oo = outer_offsets[i]
-            co = (io + oo) / 2.0
+        # --- Build (N, 2) tangent array and dz array ---
+        tang_arr = np.array(tangents, dtype=np.float64)  # (N, 2)
+        if elevation_profile is not None:
+            dz_arr = elevation_profile._profile.evaluate_array(s_vals)
+        else:
+            dz_arr = np.zeros(n, dtype=np.float64)
 
-            # 3. Compute h_t (height offset) for a given lateral offset t_offset.
-            #
-            # Normal case (level=false):
-            #   h_t = -tan(crossfall) * |t|
-            #
-            # level=true case: the lane surface is kept horizontal regardless of
-            # superelevation. Crossfall is applied relative to the inner border,
-            # then superelevation is added back to cancel out the road tilt so the
-            # lane appears flat. Mirrors the level=true branch in get_surface_pt().
-            crossfall = crossfall_profile.get_crossfall(s, is_left)
-            tan_cf = math.tan(crossfall)
+        # --- e_s: (N, 3) unit tangent ---
+        e_s = np.stack([tang_arr[:, 0], tang_arr[:, 1], dz_arr], axis=1)
+        norms = np.linalg.norm(e_s, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        e_s = e_s / norms
 
-            def _make_pt(t_offset: float) -> Point3D:
-                """Projects a point from the reference line using local coordinates."""
-                if lane_level:
-                    # Cancel superelevation: use inner border as crossfall base,
-                    # then tilt back by superelevation angle over (t - t_inner).
-                    h_inner = -tan_cf * abs(io)
-                    h_t = h_inner + math.tan(theta) * (t_offset - io)
-                else:
-                    h_t = -tan_cf * abs(t_offset)
+        # --- superelevation theta: (N,) ---
+        theta_arr = superelevation_profile._profile.evaluate_array(s_vals)
 
-                # Apply lane height offset
-                if lane_height_profile.entries:
-                    p_t = (t_offset - io) / (oo - io) if oo != io else 0.0
-                    h_t += lane_height_profile.get_height_offset(s, p_t)
+        # --- e_t: (N, 3) vectorised _compute_e_t ---
+        cos_t = np.cos(theta_arr)
+        sin_t = np.sin(theta_arr)
+        e_t = np.stack([
+            cos_t * (-e_s[:, 1]) + sin_t * (-e_s[:, 2]) * e_s[:, 0],
+            cos_t * e_s[:, 0]    + sin_t * (-e_s[:, 2]) * e_s[:, 1],
+            sin_t * (e_s[:, 0] ** 2 + e_s[:, 1] ** 2),
+        ], axis=1)
+        norms_t = np.linalg.norm(e_t, axis=1, keepdims=True)
+        norms_t = np.where(norms_t == 0, 1.0, norms_t)
+        e_t = e_t / norms_t
 
-                return Point3D(
-                    px + e_t[0] * t_offset + e_h[0] * h_t,
-                    py + e_t[1] * t_offset + e_h[1] * h_t,
-                    pz + e_t[2] * t_offset + e_h[2] * h_t,
-                )
+        # --- e_h: (N, 3) cross product e_s × e_t ---
+        e_h = np.cross(e_s, e_t)
 
-            center_pts.append(_make_pt(co))
-            inner_pts.append(_make_pt(io))
-            outer_pts.append(_make_pt(oo))
+        # --- crossfall h_t: (N,) per offset ---
+        # Evaluate crossfall per point via scalar loop (CrossfallProfile has no
+        # _CubicProfile backing, and is almost always zero in practice).
+        cf_arr = np.array(
+            [crossfall_profile.get_crossfall(float(s), is_left) for s in s_vals],
+            dtype=np.float64,
+        )
+        tan_cf = np.tan(cf_arr)
+
+        io = inner_offsets  # (N,)
+        oo = outer_offsets  # (N,)
+        co = (io + oo) * 0.5
+
+        def _h_t(t_offset: np.ndarray) -> np.ndarray:
+            if lane_level:
+                h_inner = -tan_cf * np.abs(io)
+                h = h_inner + np.tan(theta_arr) * (t_offset - io)
+            else:
+                h = -tan_cf * np.abs(t_offset)
+
+            if lane_height_profile.entries:
+                # lane_height is rare; fall back to scalar loop
+                denom = np.where(oo != io, oo - io, 1.0)
+                p_t = np.where(oo != io, (t_offset - io) / denom, 0.0)
+                for k in range(n):
+                    h[k] += lane_height_profile.get_height_offset(
+                        float(s_vals[k]), float(p_t[k])
+                    )
+            return h
+
+        def _project(t_offset: np.ndarray) -> List[Point3D]:
+            h = _h_t(t_offset)
+            xyz = ref_pts + e_t * t_offset[:, None] + e_h * h[:, None]
+            return [Point3D(float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]))
+                    for i in range(n)]
+
+        center_pts = _project(co)
+        inner_pts = _project(io)
+        outer_pts = _project(oo)
 
         # Determine Left/Right boundaries based on lane side (OpenDRIVE orientation)
         if is_left:
