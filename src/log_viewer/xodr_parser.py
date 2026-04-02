@@ -91,11 +91,21 @@ class _ParamPoly3:
         # Rescale to p∈[0,1] so the polynomial and Bézier logic is uniform.
         # Mirrors the constructor rescaling in libOpenDRIVE ParamPoly3.cpp.
         if p_range == "arcLength" and length > 0:
-            bU *= length;  cU *= length ** 2;  dU *= length ** 3
-            bV *= length;  cV *= length ** 2;  dV *= length ** 3
+            bU *= length
+            cU *= length ** 2
+            dU *= length ** 3
+            bV *= length
+            cV *= length ** 2
+            dV *= length ** 3
 
-        self._aU = aU; self._bU = bU; self._cU = cU; self._dU = dU
-        self._aV = aV; self._bV = bV; self._cV = cV; self._dV = dV
+        self._aU = aU
+        self._bU = bU
+        self._cU = cU
+        self._dU = dU
+        self._aV = aV
+        self._bV = bV
+        self._cV = cV
+        self._dV = dV
         self._length = length
 
         # Build arc-length → t LUT by sampling the curve at uniform t steps.
@@ -120,8 +130,8 @@ class _ParamPoly3:
 
     def _eval_uv(self, p: float) -> Tuple[float, float]:
         """Evaluate the polynomial at parameter p ∈ [0, 1]."""
-        u = self._aU + self._bU * p + self._cU * p ** 2 + self._dU * p ** 3
-        v = self._aV + self._bV * p + self._cV * p ** 2 + self._dV * p ** 3
+        u = self._aU + p * (self._bU + p * (self._cU + p * self._dU))
+        v = self._aV + p * (self._bV + p * (self._cV + p * self._dV))
         return u, v
 
     def _arclen_to_t(self, s: float) -> float:
@@ -344,7 +354,7 @@ class _CubicPoly:
         )
 
     def evaluate(self, s: float) -> float:
-        return self.a + self.b * s + self.c * s * s + self.d * s * s * s
+        return self.a + s * (self.b + s * (self.c + s * self.d))
 
     def derivative(self, s: float) -> float:
         return self.b + 2.0 * self.c * s + 3.0 * self.d * s * s
@@ -476,7 +486,7 @@ class _CubicProfile:
         b = self._coeffs_np[idx, 1]
         c = self._coeffs_np[idx, 2]
         d = self._coeffs_np[idx, 3]
-        return a + b * s_arr + c * s_arr ** 2 + d * s_arr ** 3
+        return a + s_arr * (b + s_arr * (c + s_arr * d))
 
     def derivative(
         self, s: float, default_val: float = 0.0, extend_start: bool = True
@@ -1028,8 +1038,10 @@ class _RoadGeometryCache:
                 for ds in ds_arr:
                     xv, yv = seg.pp3.get_xy(float(ds), seg.x0, seg.y0, seg.hdg)
                     dxv, dyv = seg.pp3.get_tangent(float(ds), seg.hdg)
-                    x_list.append(xv); y_list.append(yv)
-                    dx_list.append(dxv); dy_list.append(dyv)
+                    x_list.append(xv)
+                    y_list.append(yv)
+                    dx_list.append(dxv)
+                    dy_list.append(dyv)
                 x_arr = np.array(x_list)
                 y_arr = np.array(y_list)
                 dx_arr = np.array(dx_list)

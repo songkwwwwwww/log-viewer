@@ -10,7 +10,6 @@ import math
 import rerun as rr
 import rerun.blueprint as rrb
 import numpy as np
-from typing import Optional
 
 from .map_model import XodrMapData
 from .scene_model import SceneFrame
@@ -172,7 +171,6 @@ class LogViewer:
         Args:
             map_data: Parsed XODR map data containing lanes and boundaries.
         """
-
         # ---------- Accumulators for batched geometry ----------
         # Lane surfaces grouped by type: type -> (verts_list, indices_list, offset)
         surf_verts: dict = {t: [] for t in _LANE_COLORS}
@@ -231,15 +229,12 @@ class LogViewer:
             combined_verts = np.concatenate(verts_list)
             combined_indices = np.concatenate(surf_indices[lane_type])
             color = _LANE_COLORS[lane_type]
-            per_vert_colors = np.tile(
-                np.array(color, dtype=np.uint8), (len(combined_verts), 1)
-            )
             rr.log(
                 f"map/surfaces/{lane_type}",
                 rr.Mesh3D(
                     vertex_positions=combined_verts,
                     triangle_indices=combined_indices,
-                    vertex_colors=per_vert_colors,
+                    albedo_factor=color,
                 ),
                 static=True,
             )
